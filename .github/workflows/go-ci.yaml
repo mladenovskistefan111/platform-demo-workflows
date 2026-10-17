@@ -108,7 +108,9 @@ jobs:
       - name: Build
         env:
           BUILD_PATH: ${{ inputs.build-path }}
-        run: go build $BUILD_PATH
+        run: |
+          read -ra targets <<< "$BUILD_PATH"
+          go build "${targets[@]}"
 
   unit-tests:
     name: Unit Tests
@@ -131,7 +133,9 @@ jobs:
       - name: Run unit tests
         env:
           TEST_PACKAGES: ${{ inputs.test-packages }}
-        run: go test $TEST_PACKAGES -v -race -count=1
+        run: |
+          read -ra packages <<< "$TEST_PACKAGES"
+          go test "${packages[@]}" -v -race -count=1
 
   # ─── STAGE 2 (parallel) ───────────────────────────────────────────────────
 
@@ -205,7 +209,9 @@ jobs:
       - name: Run E2E tests (self-contained, in-process mocks)
         env:
           E2E_PACKAGES: ${{ inputs.e2e-packages }}
-        run: go test -tags e2e $E2E_PACKAGES -v -timeout 60s
+        run: |
+          read -ra packages <<< "$E2E_PACKAGES"
+          go test -tags e2e "${packages[@]}" -v -timeout 60s
 
   smoke-test:
     name: Smoke Test (gRPC health)
@@ -227,7 +233,9 @@ jobs:
       - name: Build server binary
         env:
           BUILD_PATH: ${{ inputs.build-path }}
-        run: go build -o "$RUNNER_TEMP/server" $BUILD_PATH
+        run: |
+          read -ra targets <<< "$BUILD_PATH"
+          go build -o "$RUNNER_TEMP/server" "${targets[@]}"
 
       - name: Install grpcurl
         env:
@@ -243,10 +251,11 @@ jobs:
           SMOKE_PORT: ${{ inputs.smoke-port }}
           SMOKE_ENV: ${{ inputs.smoke-env }}
         run: |
+          envs=()
           while IFS= read -r line; do
-            [ -n "$line" ] && export "$line"
+            [ -n "$line" ] && envs+=("$line")
           done <<< "$SMOKE_ENV"
-          PORT="$SMOKE_PORT" "$RUNNER_TEMP/server" &
+          env "${envs[@]}" PORT="$SMOKE_PORT" "$RUNNER_TEMP/server" &
           server_pid=$!
           trap 'kill $server_pid 2>/dev/null || true' EXIT
           sleep 2
