@@ -1,7 +1,7 @@
 name: Java Gradle CI
 
 # Reusable pipeline for Gradle services (ad-service): compile, secret scan, build, tests, SCA (Trivy fs), SAST (Semgrep).
-# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/java-gradle-ci.yaml@<sha> # <tag>
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/java-gradle-ci.yaml@<sha> # <tag>
 
 on:
   workflow_call:

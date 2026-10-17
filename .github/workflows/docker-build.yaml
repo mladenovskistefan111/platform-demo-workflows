@@ -4,7 +4,7 @@ name: Docker build and scan
 #   1. build - build once, push to ghcr.io (staging) and record the digest
 #   2. scan  - Trivy (HIGH/CRITICAL fail) on that exact digest
 # Nothing is published to Docker Hub here; see docker-promote.yaml for that.
-# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/docker-build.yaml@<tag or sha>
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/docker-build.yaml@<tag or sha>
 
 on:
   workflow_call:

@@ -2,7 +2,7 @@ name: Workflow lint
 
 # Reusable guardrail for every repo: actionlint plus a check that each `uses:` is pinned to a
 # full commit SHA (a tag or branch can be moved; a SHA cannot).
-# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/workflow-lint.yaml@<tag or sha>
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/workflow-lint.yaml@<tag or sha>
 
 on:
   workflow_call:

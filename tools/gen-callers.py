@@ -3,7 +3,7 @@
 import os, sys
 
 repo_dir, svc, sha, ver = sys.argv[1:5]
-WF = "mladenovskistefan111/platform-demo-workflows/.github/workflows"
+WF = "platform-boutique/platform-demo-workflows/.github/workflows"
 SEMGREP = {"SEMGREP_APP_TOKEN": "${{ secrets.SEMGREP_APP_TOKEN }}"}
 GO_CHECKOUT_ENV = ["PRODUCT_CATALOG_SERVICE_ADDR=localhost:3550", "CART_SERVICE_ADDR=localhost:7070",
     "CURRENCY_SERVICE_ADDR=localhost:7000", "SHIPPING_SERVICE_ADDR=localhost:50051",

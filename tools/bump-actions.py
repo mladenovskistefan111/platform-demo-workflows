@@ -6,7 +6,7 @@ usage: tools/bump-actions.py [--min-age 7] [--hold owner/repo=v5 ...] [--dry-run
   --hold  keep an action inside a major, e.g. --hold gradle/actions=v5 (v6 changed the licence of its caching component)
 
 Needs the GitHub CLI (`gh`) logged in. Prints one line per action; rewrites files in place unless --dry-run.
-Reusable workflows from this repository (mladenovskistefan111/platform-demo-workflows) are ignored: bump those with a release.
+Reusable workflows from this repository (platform-boutique/platform-demo-workflows, formerly mladenovskistefan111/...) are ignored: bump those with a release.
 """
 import argparse, datetime, json, re, subprocess, sys
 
@@ -51,7 +51,7 @@ for path in args.files:
     def sub(m):
         global changed
         repo = m.group(1)
-        if repo == "mladenovskistefan111/platform-demo-workflows":
+        if repo in ("platform-boutique/platform-demo-workflows", "mladenovskistefan111/platform-demo-workflows"):
             return m.group(0)
         n = newest(repo)
         if not n:

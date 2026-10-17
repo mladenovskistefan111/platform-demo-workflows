@@ -1,7 +1,7 @@
 name: .NET CI
 
 # Reusable pipeline for .NET services (cart-service): format + analyzers, secret scan, build, tests, SCA (dotnet list --vulnerable), SAST (Semgrep).
-# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/dotnet-ci.yaml@<sha> # <tag>
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/dotnet-ci.yaml@<sha> # <tag>
 
 on:
   workflow_call:

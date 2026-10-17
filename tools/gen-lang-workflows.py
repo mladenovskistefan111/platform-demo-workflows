@@ -97,7 +97,7 @@ def header(name, desc, inputs, secrets=False):
     return f"""name: {name}
 
 # {desc}
-# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/{{FILE}}@<sha> # <tag>
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/{{FILE}}@<sha> # <tag>
 
 on:
   workflow_call:

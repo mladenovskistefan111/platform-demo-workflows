@@ -1,7 +1,7 @@
 name: Python CI
 
 # Reusable pipeline for the Python services (email, recommendation): ruff, secret scan, import check, pytest, SCA (pip-audit), SAST (bandit).
-# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/python-ci.yaml@<sha> # <tag>
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/python-ci.yaml@<sha> # <tag>
 
 on:
   workflow_call:
