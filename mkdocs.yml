@@ -1,0 +1,22 @@
+site_name: platform-demo-workflows
+site_description: Reusable GitHub Actions workflows shared by the platform-demo repositories.
+repo_url: https://github.com/platform-boutique/platform-demo-workflows
+edit_uri: edit/main/docs/
+nav:
+  - Overview: index.md
+  - How a service calls them: calling.md
+  - Release model: release-model.md
+  - Dependabot: dependabot.md
+  - Changing a workflow: changing.md
+  - Things to know: things-to-know.md
+  - Version history: history.md
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+plugins:
+  - techdocs-core
+extra_css:
+  - stylesheets/extra.css
