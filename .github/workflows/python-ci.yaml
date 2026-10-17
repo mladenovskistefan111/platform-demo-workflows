@@ -1,0 +1,183 @@
+name: Python CI
+
+# Reusable pipeline for the Python services (email, recommendation): ruff, secret scan, import check, pytest, SCA (pip-audit), SAST (bandit).
+# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/python-ci.yaml@<sha> # <tag>
+
+on:
+  workflow_call:
+    inputs:
+      python-version-file:
+        type: string
+        default: .python-version
+      source-dir:
+        description: Directory scanned by bandit
+        type: string
+        default: src/
+      build-check-file:
+        description: Entry-point file that must parse
+        type: string
+        default: src/server.py
+      tests-path:
+        type: string
+        default: tests/
+      bandit-config:
+        type: string
+        default: pyproject.toml
+      ruff-version:
+        type: string
+        default: 0.11.6
+      pip-audit-version:
+        type: string
+        default: 2.9.0
+      bandit-version:
+        type: string
+        default: 1.8.3
+
+# Least privilege by default; every job below declares what it needs.
+permissions: {}
+
+jobs:
+  lint-format:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: ${{ inputs.python-version-file }}
+          cache: pip
+
+      - name: Install lint tools
+        env:
+          VERSION: ${{ inputs.ruff-version }}
+        run: pip install "ruff==${VERSION}"
+
+      - name: Check formatting (ruff format)
+        run: ruff format --check .
+
+      - name: Run linter (ruff check)
+        run: ruff check .
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # gitleaks lists the PR's commits through the API
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0 # full history so gitleaks scans every commit
+          persist-credentials: false
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+  build-check:
+    name: Build Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: ${{ inputs.python-version-file }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify entry point parses (build smoke)
+        env:
+          BUILD_FILE: ${{ inputs.build-check-file }}
+        run: python -c "import ast, os; ast.parse(open(os.environ['BUILD_FILE']).read()); print('Parse OK')"
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: ${{ inputs.python-version-file }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run unit tests
+        env:
+          TESTS_PATH: ${{ inputs.tests-path }}
+        run: pytest "$TESTS_PATH" -v --tb=short
+
+  # ─── STAGE 2 (parallel) ───────────────────────────────────────────────────
+
+  sca:
+    name: SCA - Dependency Vulnerabilities
+    runs-on: ubuntu-latest
+    needs: [lint-format, secret-scan, build-check, unit-tests]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: ${{ inputs.python-version-file }}
+          cache: pip
+
+      - name: Install pip-audit
+        env:
+          VERSION: ${{ inputs.pip-audit-version }}
+        run: pip install "pip-audit==${VERSION}"
+
+      - name: Run pip-audit
+        run: pip-audit -r requirements.txt
+
+  sast:
+    name: SAST - Static Security Analysis
+    runs-on: ubuntu-latest
+    needs: [lint-format, secret-scan, build-check, unit-tests]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: ${{ inputs.python-version-file }}
+          cache: pip
+
+      - name: Install bandit
+        env:
+          VERSION: ${{ inputs.bandit-version }}
+        run: pip install "bandit==${VERSION}"
+
+      - name: Run bandit
+        env:
+          SOURCE_DIR: ${{ inputs.source-dir }}
+          BANDIT_CONFIG: ${{ inputs.bandit-config }}
+        run: bandit -r "$SOURCE_DIR" -c "$BANDIT_CONFIG"

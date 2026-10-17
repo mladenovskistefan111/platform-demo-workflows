@@ -10,7 +10,13 @@ carrying their own copy of a 300-line pipeline, so a fix or a version bump lands
 | [`docker-promote.yaml`](.github/workflows/docker-promote.yaml) | copy the scanned digest to Docker Hub (no rebuild), tag, cosign-sign, verify, attach SBOM; refuses commits not on `main` | every service |
 | [`workflow-lint.yaml`](.github/workflows/workflow-lint.yaml) | actionlint + "every `uses:` is pinned to a full commit SHA" | every repo |
 
-Node, Python, Java and .NET CI workflows follow the same shape and are added language by language.
+| [`node-ci.yaml`](.github/workflows/node-ci.yaml) | format/typecheck/lint, secret scan, build, tests, `npm audit`, Semgrep, optional gRPC smoke test | currency, payment |
+| [`python-ci.yaml`](.github/workflows/python-ci.yaml) | ruff, secret scan, entry-point parse check, pytest, pip-audit, bandit | email, recommendation |
+| [`java-gradle-ci.yaml`](.github/workflows/java-gradle-ci.yaml) | compile, secret scan, build, tests, Trivy fs scan, Semgrep | ad |
+| [`dotnet-ci.yaml`](.github/workflows/dotnet-ci.yaml) | `dotnet format` + analyzers, secret scan, build, tests, vulnerable-package audit, Semgrep | cart |
+
+Every language workflow has the same job names (`Lint & Format`, `Secret Scan`, `Build Check`, `Unit Tests`,
+`SCA - Dependency Vulnerabilities`, `SAST - Static Security Analysis`), so branch protection looks the same everywhere.
 
 ## How a service calls them
 

@@ -1,0 +1,222 @@
+name: Node CI
+
+# Reusable pipeline for the Node/TypeScript services (currency, payment): format/typecheck/lint, secret scan, build, tests, SCA (npm audit), SAST (Semgrep), optional gRPC smoke test.
+# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/node-ci.yaml@<sha> # <tag>
+
+on:
+  workflow_call:
+    inputs:
+      node-version-file:
+        type: string
+        default: .nvmrc
+      semgrep-config:
+        type: string
+        default: p/typescript p/nodejs p/secrets
+      smoke-port:
+        description: gRPC port for a start-the-server health smoke test; empty skips the job
+        type: string
+        default: ""
+      smoke-command:
+        description: Command that starts the built server (run after the build)
+        type: string
+        default: node dist/server.js
+      smoke-health-args:
+        description: Extra grpcurl arguments for the health check (no reflection, so point at the proto)
+        type: string
+        default: -import-path ./proto -proto health.proto
+      smoke-script:
+        description: Optional script in the caller repo for service-specific checks (gets GRPCURL and SMOKE_PORT)
+        type: string
+        default: ""
+    secrets:
+      SEMGREP_APP_TOKEN:
+        required: false
+
+# Least privilege by default; every job below declares what it needs.
+permissions: {}
+
+jobs:
+  lint-format:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # gitleaks lists the PR's commits through the API
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0 # full history so gitleaks scans every commit
+          persist-credentials: false
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+  build-check:
+    name: Build Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm run test:ci
+
+  # ─── STAGE 2 (parallel) ───────────────────────────────────────────────────
+
+  sca:
+    name: SCA - Dependency Vulnerabilities
+    runs-on: ubuntu-latest
+    needs: [lint-format, secret-scan, build-check, unit-tests]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit
+        # audit-level=high: fail only on high/critical findings
+        run: npm audit --audit-level=high --omit=dev
+
+  sast:
+    name: SAST - Static Security Analysis
+    runs-on: ubuntu-latest
+    needs: [lint-format, secret-scan, build-check, unit-tests]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@713efdd345f3035192eaa63f56867b88e63e4e5d # v1
+        with:
+          config: ${{ inputs.semgrep-config }}
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+  smoke-test:
+    name: Smoke Test (gRPC health)
+    if: inputs.smoke-port != ''
+    runs-on: ubuntu-latest
+    needs: [lint-format, secret-scan, build-check, unit-tests]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build server
+        run: npm run build
+
+      - name: Install grpcurl
+        env:
+          VERSION: 1.9.1
+          SHA256: 588c9c429476d9ed66cd3b2ae32283a6da36e0cfbb7e446f5d6a1b68dc770214
+        run: |
+          curl -fsSL -o grpcurl.tgz "https://github.com/fullstorydev/grpcurl/releases/download/v${VERSION}/grpcurl_${VERSION}_linux_x86_64.tar.gz"
+          echo "${SHA256}  grpcurl.tgz" | sha256sum -c -
+          tar -xzf grpcurl.tgz -C "$RUNNER_TEMP" grpcurl
+
+      - name: Start server and check gRPC health
+        env:
+          SMOKE_PORT: ${{ inputs.smoke-port }}
+          SMOKE_COMMAND: ${{ inputs.smoke-command }}
+          HEALTH_ARGS: ${{ inputs.smoke-health-args }}
+          SMOKE_SCRIPT: ${{ inputs.smoke-script }}
+        run: |
+          export GRPCURL="$RUNNER_TEMP/grpcurl"
+          PORT="$SMOKE_PORT" $SMOKE_COMMAND &
+          server_pid=$!
+          trap 'kill $server_pid 2>/dev/null || true' EXIT
+          sleep 2
+          response=$("$GRPCURL" -plaintext $HEALTH_ARGS "localhost:${SMOKE_PORT}" grpc.health.v1.Health/Check)
+          status=$(echo "$response" | grep -o '"status": "[^"]*"' | cut -d'"' -f4)
+          if [ "$status" != "SERVING" ]; then
+            echo "FAIL: expected SERVING, got '$status'"
+            exit 1
+          fi
+          echo "PASS: service is SERVING"
+          if [ -n "$SMOKE_SCRIPT" ]; then
+            bash "$SMOKE_SCRIPT"
+          fi

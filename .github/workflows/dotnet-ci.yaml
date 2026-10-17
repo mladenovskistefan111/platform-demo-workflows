@@ -1,0 +1,188 @@
+name: .NET CI
+
+# Reusable pipeline for .NET services (cart-service): format + analyzers, secret scan, build, tests, SCA (dotnet list --vulnerable), SAST (Semgrep).
+# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/dotnet-ci.yaml@<sha> # <tag>
+
+on:
+  workflow_call:
+    inputs:
+      dotnet-version-file:
+        type: string
+        default: global.json
+      solution:
+        type: string
+        required: true
+      project:
+        description: Main project (build + vulnerability audit)
+        type: string
+        required: true
+      test-project:
+        type: string
+        required: true
+      test-filter:
+        type: string
+        default: FullyQualifiedName!~Integration&FullyQualifiedName!~E2E
+      semgrep-config:
+        type: string
+        default: p/csharp p/owasp-top-ten
+    secrets:
+      SEMGREP_APP_TOKEN:
+        required: false
+
+# Least privilege by default; every job below declares what it needs.
+permissions: {}
+
+jobs:
+  lint-format:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version-file: ${{ inputs.dotnet-version-file }}
+
+      - name: Restore tools
+        run: dotnet tool restore
+
+      - name: Check formatting
+        run: dotnet format --verify-no-changes --verbosity diagnostic
+
+      - name: Lint (Roslyn Analyzers)
+        env:
+          SOLUTION: ${{ inputs.solution }}
+        run: dotnet build "$SOLUTION" --configuration Release /warnaserror
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # gitleaks lists the PR's commits through the API
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0 # full history so gitleaks scans every commit
+          persist-credentials: false
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+  build-check:
+    name: Build Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version-file: ${{ inputs.dotnet-version-file }}
+
+      - name: Build
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: dotnet build "$PROJECT" --configuration Release
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write # test-reporter publishes a check run
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version-file: ${{ inputs.dotnet-version-file }}
+
+      - name: Restore dependencies
+        env:
+          TEST_PROJECT: ${{ inputs.test-project }}
+        run: dotnet restore "$TEST_PROJECT"
+
+      - name: Run unit tests
+        env:
+          TEST_PROJECT: ${{ inputs.test-project }}
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          dotnet test "$TEST_PROJECT" \
+            --configuration Release \
+            --no-restore \
+            --filter "$TEST_FILTER" \
+            --logger "trx;LogFileName=unit-test-results.trx" \
+            --results-directory ./test-results
+
+      - name: Publish test results
+        uses: dorny/test-reporter@d61b558e8df85cb60d09ca3e5b09653b4477cea7 # v1
+        if: always()
+        with:
+          name: Unit Test Results
+          path: test-results/unit-test-results.trx
+          reporter: dotnet-trx
+
+  # ─── STAGE 2 (parallel) ───────────────────────────────────────────────────
+
+  sca:
+    name: SCA - Dependency Vulnerabilities
+    runs-on: ubuntu-latest
+    needs: [lint-format, secret-scan, build-check, unit-tests]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version-file: ${{ inputs.dotnet-version-file }}
+
+      - name: Restore dependencies
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: dotnet restore "$PROJECT"
+
+      - name: Check for vulnerable packages
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: |
+          dotnet list "$PROJECT" package --vulnerable --include-transitive 2>&1 | tee vuln-report.txt
+          if grep -q "has the following vulnerable packages" vuln-report.txt; then
+            echo "FAIL: vulnerable packages found"
+            cat vuln-report.txt
+            exit 1
+          fi
+          echo "PASS: no vulnerable packages found"
+
+  sast:
+    name: SAST - Static Security Analysis
+    runs-on: ubuntu-latest
+    needs: [lint-format, secret-scan, build-check, unit-tests]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@713efdd345f3035192eaa63f56867b88e63e4e5d # v1
+        with:
+          config: ${{ inputs.semgrep-config }}
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
