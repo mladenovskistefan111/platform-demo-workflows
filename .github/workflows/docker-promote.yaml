@@ -116,7 +116,10 @@ jobs:
       - name: Sign image
         env:
           REF: ${{ steps.promote.outputs.ref }}
-        run: cosign sign --yes "$REF"
+        # Classic signature (a `sha256-<digest>.sig` tag). cosign 3's default bundle format is stored as an OCI referrer, which
+        # Docker Hub does not serve, so the signature would be written but never found (and Kyverno/most verifiers expect the
+        # classic layout today).
+        run: cosign sign --yes --new-bundle-format=false --use-signing-config=false "$REF"
 
       - name: Verify the signature we just made
         env:
@@ -124,7 +127,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           # Keyless identity is the workflow that ran the signing job.
-          cosign verify \
+          cosign verify --new-bundle-format=false \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity-regexp "^https://github.com/(mladenovskistefan111/platform-demo-workflows|${REPO})/\.github/workflows/.+@" \
             "$REF" > /dev/null
@@ -139,14 +142,14 @@ jobs:
       - name: Attach SBOM to image as a signed attestation
         env:
           REF: ${{ steps.promote.outputs.ref }}
-        run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$REF"
+        run: cosign attest --yes --new-bundle-format=false --use-signing-config=false --type spdxjson --predicate sbom.spdx.json "$REF"
 
       - name: Verify the SBOM attestation we just made
         env:
           REF: ${{ steps.promote.outputs.ref }}
           REPO: ${{ github.repository }}
         run: |
-          cosign verify-attestation --type spdxjson \
+          cosign verify-attestation --new-bundle-format=false --type spdxjson \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity-regexp "^https://github.com/(mladenovskistefan111/platform-demo-workflows|${REPO})/\.github/workflows/.+@" \
             "$REF" > /dev/null
