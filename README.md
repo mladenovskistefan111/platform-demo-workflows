@@ -7,7 +7,7 @@ carrying their own copy of a 300-line pipeline, so a fix or a version bump lands
 |---|---|---|
 | [`go-ci.yaml`](.github/workflows/go-ci.yaml) | lint/format, secret scan, build, unit tests, then SCA (govulncheck) and SAST (gosec) | checkout, shipping, product-catalog, frontend |
 | [`docker-build.yaml`](.github/workflows/docker-build.yaml) | build once, stage on ghcr.io, Trivy-scan that exact digest (HIGH/CRITICAL fail) | every service |
-| [`docker-promote.yaml`](.github/workflows/docker-promote.yaml) | copy the scanned digest to Docker Hub (no rebuild), tag, cosign-sign, verify, attach SBOM; refuses commits not on `main` | every service |
+| [`docker-promote.yaml`](.github/workflows/docker-promote.yaml) | copy the scanned digest to Docker Hub (no rebuild), tag, cosign-sign (cosign 3), verify, attach the SBOM as a signed `spdxjson` attestation; refuses commits not on `main` | every service |
 | [`secret-scan.yaml`](.github/workflows/secret-scan.yaml) | stand-alone gitleaks scan (full history) | helm, observability, product-catalog-db |
 | [`workflow-lint.yaml`](.github/workflows/workflow-lint.yaml) | actionlint + "every `uses:` is pinned to a full commit SHA" | every repo |
 
