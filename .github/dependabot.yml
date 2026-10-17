@@ -4,8 +4,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7 # let a new release settle before it is proposed
     commit-message:
       prefix: "chore(deps)"
     groups:
-      actions:
-        patterns: ["*"]
+      # Only minor/patch are batched; every major bump arrives as its own PR so it can be tested
+      # (e.g. cosign-installer v4 moves to cosign 3.x, which changes `attach sbom` and signatures).
+      minor-and-patch:
+        update-types: [minor, patch]
