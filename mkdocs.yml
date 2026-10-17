@@ -18,5 +18,3 @@ theme:
     - content.code.copy
 plugins:
   - techdocs-core
-extra_css:
-  - stylesheets/extra.css
