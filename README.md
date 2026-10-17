@@ -64,7 +64,7 @@ than its caller grants, so each job lists what it needs (`id-token: write` only 
 
 Tools (all need the GitHub CLI logged in): `tools/bump-actions.py` (move every pin to the newest release older than N days,
 `--hold gradle/actions=v5`), `tools/gen-lang-workflows.py`, `tools/gen-callers.py`, `tools/gen-guardrails.py` (CODEOWNERS,
-Dependabot, `.pre-commit-config.yaml` for a repo), `tools/required-checks.sh` + `tools/protect-repo.sh` (branch protection with the
+Dependabot, `.pre-commit-config.yaml` for a repo), `tools/transfer-repo.sh` (move a repo to the org and re-apply what a transfer resets), `tools/required-checks.sh` + `tools/protect-repo.sh` (branch protection with the
 required checks taken from a repo's last green PR, squash-only merges, secret scanning, tag ruleset).
 
 ## Things to know
