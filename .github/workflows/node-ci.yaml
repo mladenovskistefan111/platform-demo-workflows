@@ -12,6 +12,9 @@ on:
       semgrep-config:
         type: string
         default: p/typescript p/nodejs p/secrets
+      semgrep-version:
+        type: string
+        default: 1.180.0
       smoke-port:
         description: gRPC port for a start-the-server health smoke test; empty skips the job
         type: string
@@ -28,9 +31,6 @@ on:
         description: Optional script in the caller repo for service-specific checks (gets GRPCURL and SMOKE_PORT)
         type: string
         default: ""
-    secrets:
-      SEMGREP_APP_TOKEN:
-        required: false
 
 # Least privilege by default; every job below declares what it needs.
 permissions: {}
@@ -42,11 +42,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ${{ inputs.node-version-file }}
           cache: npm
@@ -70,13 +70,13 @@ jobs:
       contents: read
       pull-requests: read # gitleaks lists the PR's commits through the API
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # full history so gitleaks scans every commit
           persist-credentials: false
 
       - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_ENABLE_COMMENTS: "false"
@@ -87,11 +87,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ${{ inputs.node-version-file }}
           cache: npm
@@ -108,11 +108,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ${{ inputs.node-version-file }}
           cache: npm
@@ -132,11 +132,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ${{ inputs.node-version-file }}
           cache: npm
@@ -155,16 +155,29 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Run Semgrep
-        uses: semgrep/semgrep-action@713efdd345f3035192eaa63f56867b88e63e4e5d # v1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          config: ${{ inputs.semgrep-config }}
+          python-version: "3.13"
+
+      - name: Install Semgrep
         env:
-          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+          VERSION: ${{ inputs.semgrep-version }}
+        run: pip install "semgrep==${VERSION}"
+
+      - name: Run Semgrep
+        env:
+          SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+        run: |
+          read -ra rules <<< "$SEMGREP_CONFIG"
+          args=()
+          for rule in "${rules[@]}"; do
+            args+=(--config "$rule")
+          done
+          semgrep scan "${args[@]}" --error --metrics=off
 
   smoke-test:
     name: Smoke Test (gRPC health)
@@ -174,11 +187,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ${{ inputs.node-version-file }}
           cache: npm
@@ -191,8 +204,8 @@ jobs:
 
       - name: Install grpcurl
         env:
-          VERSION: 1.9.1
-          SHA256: 588c9c429476d9ed66cd3b2ae32283a6da36e0cfbb7e446f5d6a1b68dc770214
+          VERSION: 1.9.4
+          SHA256: 97e13d58d2733a0e62cd2571d1d5f0c02823f0d25282f08bddedf1ad9c5d1736
         run: |
           curl -fsSL -o grpcurl.tgz "https://github.com/fullstorydev/grpcurl/releases/download/v${VERSION}/grpcurl_${VERSION}_linux_x86_64.tar.gz"
           echo "${SHA256}  grpcurl.tgz" | sha256sum -c -
