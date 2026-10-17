@@ -1,7 +1,7 @@
 # platform-demo-workflows
 
 Reusable GitHub Actions workflows shared by the platform-demo repositories. Services call these instead of carrying their own
-copy of a 300-line pipeline, so a fix or a version bump lands once. Current release: **v2.0.1** (history below).
+copy of a 300-line pipeline, so a fix or a version bump lands once. Current release: **v2.0.2** (history below).
 
 | Workflow | Purpose | Used by |
 |---|---|---|
@@ -12,7 +12,7 @@ copy of a 300-line pipeline, so a fix or a version bump lands once. Current rele
 | [`dotnet-ci.yaml`](.github/workflows/dotnet-ci.yaml) | `dotnet format` + analyzers, secret scan, build, tests, vulnerable-package audit, Semgrep | cart |
 | [`docker-build.yaml`](.github/workflows/docker-build.yaml) | build once, stage on ghcr.io, Trivy-scan that exact digest (HIGH/CRITICAL fail) | every service |
 | [`docker-promote.yaml`](.github/workflows/docker-promote.yaml) | copy the scanned digest to Docker Hub (no rebuild), tag, cosign-sign, self-verify, attach the SBOM as a signed `spdxjson` attestation, self-verify; refuses commits not on `main` | every service |
-| [`secret-scan.yaml`](.github/workflows/secret-scan.yaml) | stand-alone gitleaks scan (full history) | helm, observability, product-catalog-db |
+| [`secret-scan.yaml`](.github/workflows/secret-scan.yaml) | stand-alone gitleaks scan (the pull request's commits; full history on manual runs) | helm, observability, product-catalog-db |
 | [`workflow-lint.yaml`](.github/workflows/workflow-lint.yaml) | actionlint (+ shellcheck on CI runners) and "every `uses:` is pinned to a full commit SHA" | every repo (this one included) |
 
 Every language workflow has the same job names (`Lint & Format`, `Secret Scan`, `Build Check`, `Unit Tests`,
@@ -90,3 +90,4 @@ required checks taken from a repo's last green PR, squash-only merges, secret sc
 | v1.2.0 | stand-alone secret-scan |
 | v2.0.0 | all actions to their newest settled release (Node 24), cosign 3, SBOM as attestation, Semgrep via pip (breaking: callers no longer pass `SEMGREP_APP_TOKEN`) |
 | v2.0.1 | classic cosign signature format (Docker Hub has no referrers API) |
+| v2.0.2 | secret scan runs the open-source **gitleaks CLI** (pinned, SHA-256 checked) instead of `gitleaks-action`, whose license is paid for organisation-owned repositories; the cosign self-verification accepts the workflows repo under both owners (`mladenovskistefan111`, `platform-boutique`) |

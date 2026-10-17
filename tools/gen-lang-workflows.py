@@ -10,7 +10,6 @@ SHA = dict(
     java="actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1",
     gradle="gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2",
     dotnet="actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0",
-    gitleaks="gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0",
     semgrep="semgrep/semgrep-action@713efdd345f3035192eaa63f56867b88e63e4e5d # v1",
     trivy="aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0",
     upload="actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2",
@@ -42,12 +41,28 @@ def job(key, name, body, needs=None, perms="contents: read", extra="", cond=""):
 
 def secret_scan():
     return job("secret-scan", "Secret Scan", steps(co(True), f"""
-- name: Run Gitleaks
-  uses: {SHA['gitleaks']}
+- name: Install gitleaks
   env:
-    GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
-    GITLEAKS_ENABLE_COMMENTS: "false"
-"""), perms="contents: read;pull-requests: read # gitleaks lists the PR's commits through the API")
+    GITLEAKS_VERSION: "8.30.1"
+    GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  run: |
+    curl -fsSL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${{GITLEAKS_VERSION}}/gitleaks_${{GITLEAKS_VERSION}}_linux_x64.tar.gz"
+    echo "${{GITLEAKS_SHA256}}  gitleaks.tgz" | sha256sum -c -
+    tar -xzf gitleaks.tgz gitleaks
+    sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+
+- name: Run gitleaks
+  env:
+    BASE_SHA: ${{{{ github.event.pull_request.base.sha }}}}
+    HEAD_SHA: ${{{{ github.event.pull_request.head.sha }}}}
+  run: |
+    # the open-source CLI, not gitleaks-action: the Action needs a paid license in organisation-owned repositories
+    if [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
+      gitleaks git --redact --verbose --log-opts="${{BASE_SHA}}..${{HEAD_SHA}}"   # the pull request's commits
+    else
+      gitleaks git --redact --verbose                                           # manual run: the whole history
+    fi
+"""), perms="contents: read")
 
 def semgrep(inputname="semgrep-config"):
     return job("sast", "SAST - Static Security Analysis", steps(co(), f"""
