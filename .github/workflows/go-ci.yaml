@@ -2,7 +2,7 @@ name: Go CI
 
 # Reusable pipeline for the Go services (checkout, shipping, product-catalog, frontend):
 # lint/format, secret scan, build, unit tests, then SCA + SAST.
-# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/go-ci.yaml@<tag or sha>
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/go-ci.yaml@<tag or sha>
 
 on:
   workflow_call:

@@ -1,7 +1,7 @@
 name: Node CI
 
 # Reusable pipeline for the Node/TypeScript services (currency, payment): format/typecheck/lint, secret scan, build, tests, SCA (npm audit), SAST (Semgrep), optional gRPC smoke test.
-# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/node-ci.yaml@<sha> # <tag>
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/node-ci.yaml@<sha> # <tag>
 
 on:
   workflow_call:

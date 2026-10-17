@@ -3,7 +3,7 @@ name: Docker promote, sign and SBOM
 # Promotes an image that docker-build.yaml already scanned: the *same digest* is copied from
 # ghcr.io to Docker Hub (no rebuild), tagged, signed with cosign (keyless) and given an SBOM.
 # Refuses to run unless the commit is reachable from `main`.
-# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/docker-promote.yaml@<tag or sha>
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/docker-promote.yaml@<tag or sha>
 
 on:
   workflow_call:

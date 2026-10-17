@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # usage: protect.sh repo '<json array of contexts>'
 set -uo pipefail
-r=$1; ctx=$2; O=mladenovskistefan111
+r=$1; ctx=$2; O=${OWNER:-platform-boutique}   # GitHub owner of the repositories (the organisation)
 api(){ gh api "$@" >/dev/null 2>"$tmp" || { echo "   ! $* :: $(head -c 200 "$tmp")"; return 1; }; }
 tmp=$(mktemp)
 # repo settings: squash only, auto-delete branches
