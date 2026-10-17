@@ -1,0 +1,43 @@
+name: Workflow lint
+
+# Reusable guardrail for every repo: actionlint plus a check that each `uses:` is pinned to a
+# full commit SHA (a tag or branch can be moved; a SHA cannot).
+# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/workflow-lint.yaml@<tag or sha>
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  actionlint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Every action and reusable workflow is pinned to a commit SHA
+        run: |
+          shopt -s nullglob
+          files=(.github/workflows/*.y*ml .github/actions/*/action.y*ml)
+          [ ${#files[@]} -gt 0 ] || exit 0
+          unpinned=$(grep -nE '^[[:space:]-]*uses:[[:space:]]*[^./[:space:]]' "${files[@]}" | grep -vE '@[0-9a-f]{40}([[:space:]]|$)' || true)
+          if [ -n "$unpinned" ]; then
+            echo "::error::These references are not pinned to a full commit SHA:"
+            echo "$unpinned"
+            exit 1
+          fi
+
+      - name: actionlint
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl -fsSL -o actionlint.tgz "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
+          echo "${SHA256}  actionlint.tgz" | sha256sum -c -
+          tar xzf actionlint.tgz actionlint
+          ./actionlint -color

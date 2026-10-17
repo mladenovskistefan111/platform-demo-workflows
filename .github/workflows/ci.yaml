@@ -1,0 +1,14 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  lint:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/workflow-lint.yaml

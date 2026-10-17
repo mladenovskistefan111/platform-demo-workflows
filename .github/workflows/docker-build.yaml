@@ -1,0 +1,111 @@
+name: Docker build and scan
+
+# Language-agnostic image gate shared by all services:
+#   1. build - build once, push to ghcr.io (staging) and record the digest
+#   2. scan  - Trivy (HIGH/CRITICAL fail) on that exact digest
+# Nothing is published to Docker Hub here; see docker-promote.yaml for that.
+# Call it with:  uses: mladenovskistefan111/platform-demo-workflows/.github/workflows/docker-build.yaml@<tag or sha>
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        type: string
+        default: .
+      dockerfile:
+        type: string
+        default: Dockerfile
+      trivyignores:
+        description: Path to a .trivyignore file in the caller repo (optional)
+        type: string
+        default: ""
+    outputs:
+      staged-image:
+        description: ghcr.io reference (by digest) that was scanned
+        value: ${{ jobs.build.outputs.staged-image }}
+      digest:
+        description: Image digest that was scanned
+        value: ${{ jobs.build.outputs.digest }}
+
+# Least privilege by default; every job below declares what it needs.
+permissions: {}
+
+jobs:
+  build:
+    name: Build & Stage Image (ghcr.io)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      staged-image: ${{ steps.image-ref.outputs.ref }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,prefix=sha-
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and push to ghcr.io (staging)
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record the staged image reference (by digest)
+        id: image-ref
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+  scan-image:
+    name: Scan Image for CVEs
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        if: inputs.trivyignores != ''
+        with:
+          persist-credentials: false
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: ${{ needs.build.outputs.staged-image }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          trivyignores: ${{ inputs.trivyignores }}
