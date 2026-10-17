@@ -45,4 +45,4 @@ A reusable workflow can never get more permissions than its caller grants, so ea
   `:1.4.0`, `:sha-<short>` and `:latest`.
 - Environments are not branches. They are values files / directories in `platform-demo-helm`
   (Argo CD watches `main`), and promotion is a PR that bumps the image digest for that environment.
-- This repo is versioned the same way: `v1.x.y` tags, with a moving `v1` tag for convenience (callers still pin a SHA).
+- This repo is versioned the same way: immutable `v1.x.y` tags. Callers pin the tag's commit SHA with the version in a trailing comment.
