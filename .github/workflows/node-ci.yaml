@@ -206,11 +206,13 @@ jobs:
           SMOKE_SCRIPT: ${{ inputs.smoke-script }}
         run: |
           export GRPCURL="$RUNNER_TEMP/grpcurl"
-          PORT="$SMOKE_PORT" $SMOKE_COMMAND &
+          read -ra server_cmd <<< "$SMOKE_COMMAND"
+          read -ra health_args <<< "$HEALTH_ARGS"
+          PORT="$SMOKE_PORT" "${server_cmd[@]}" &
           server_pid=$!
           trap 'kill $server_pid 2>/dev/null || true' EXIT
           sleep 2
-          response=$("$GRPCURL" -plaintext $HEALTH_ARGS "localhost:${SMOKE_PORT}" grpc.health.v1.Health/Check)
+          response=$("$GRPCURL" -plaintext "${health_args[@]}" "localhost:${SMOKE_PORT}" grpc.health.v1.Health/Check)
           status=$(echo "$response" | grep -o '"status": "[^"]*"' | cut -d'"' -f4)
           if [ "$status" != "SERVING" ]; then
             echo "FAIL: expected SERVING, got '$status'"
