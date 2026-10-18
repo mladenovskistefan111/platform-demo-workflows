@@ -143,7 +143,7 @@ jobs:
             echo "**Result:** ${line:-see the plan below}"
             echo
             if [ "$HAS_CHANGES" = "true" ]; then
-              echo "Nothing has been changed. Plan id: \`$PLAN_ID\` (saved for 7 days). To apply exactly this plan, start the apply workflow with this plan id; a reviewer then approves it."
+              echo "Nothing has been changed. Plan id: \`$PLAN_ID\` (saved for 7 days). The next jobs review this exact plan, and the apply waits for approval by a reviewer. A caller that stops here can apply it later by passing the plan id to terraform-apply."
               echo
               echo '```'
               cat changes.txt
