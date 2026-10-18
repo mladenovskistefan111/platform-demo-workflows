@@ -24,7 +24,7 @@ on:
       directories:
         description: Root modules to validate, space separated.
         type: string
-        default: "envs/platform bootstrap"
+        default: "stacks/platform stacks/foundation stacks/bootstrap"
       plan_directory:
         description: Root module to plan (empty = no plan).
         type: string
@@ -41,7 +41,7 @@ on:
         type: string
         default: us-east-1
       role_to_assume:
-        description: IAM role to assume through GitHub OIDC (empty = use the AWS_* secrets).
+        description: Read-only IAM role (ARN) to assume through GitHub OIDC for the plan (empty = no plan).
         type: string
         default: ""
       tf_vars:
@@ -49,10 +49,6 @@ on:
         type: string
         default: "{}"
     secrets:
-      AWS_ACCESS_KEY_ID:
-        required: false
-      AWS_SECRET_ACCESS_KEY:
-        required: false
       INFRACOST_API_KEY:
         required: false
 
@@ -193,7 +189,7 @@ jobs:
 
   plan:
     name: Plan
-    # Pull requests from the same repository only: a fork must never get the AWS secrets.
+    # Pull requests from the same repository only: a fork must never get AWS access.
     if: inputs.plan_directory != '' && inputs.state_bucket != '' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
@@ -205,12 +201,12 @@ jobs:
       PLAN_DIRECTORY: ${{ inputs.plan_directory }}
       STATE_BUCKET: ${{ inputs.state_bucket }}
       AWS_REGION: ${{ inputs.aws_region }}
-      HAS_AWS: ${{ inputs.role_to_assume != '' || secrets.AWS_ACCESS_KEY_ID != '' }}
+      HAS_AWS: ${{ inputs.role_to_assume != '' }}
     steps:
       - name: Skipped without AWS access
         if: env.HAS_AWS != 'true'
         run: |
-          echo "::notice::No AWS credentials (secrets or role): the plan is skipped."
+          echo "::notice::No role_to_assume: the plan is skipped."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: env.HAS_AWS == 'true'
         with:
@@ -220,8 +216,6 @@ jobs:
         with:
           aws-region: ${{ inputs.aws_region }}
           role-to-assume: ${{ inputs.role_to_assume }}
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         if: env.HAS_AWS == 'true'
         with:
@@ -231,7 +225,7 @@ jobs:
         if: env.HAS_AWS == 'true'
         run: |
           if aws s3api head-bucket --bucket "$STATE_BUCKET" 2>/dev/null; then echo "HAS_STATE=true" >> "$GITHUB_ENV"
-          else echo "::notice::State bucket $STATE_BUCKET does not exist yet (run the bootstrap workflow): no plan."; fi
+          else echo "::notice::State bucket $STATE_BUCKET does not exist yet (run scripts/bootstrap.sh): no plan."; fi
       - name: Plan
         if: env.HAS_AWS == 'true' && env.HAS_STATE == 'true'
         env:
@@ -243,7 +237,7 @@ jobs:
           set -a; . ./tfvars.env; set +a
           terraform -chdir="$PLAN_DIRECTORY" init -input=false -lockfile=readonly -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
           # -refresh=false: the plan compares the code with the state and does not call the cluster API (which only the maintainer's
-          # address and the deploy runner may reach), so it never touches the running platform.
+          # is open to IAM-authenticated callers only), so it never touches the running platform.
           set +e
           terraform -chdir="$PLAN_DIRECTORY" plan -input=false -no-color -refresh=false -lock-timeout=5m -out=tfplan > plan.log 2>&1
           code=$?
