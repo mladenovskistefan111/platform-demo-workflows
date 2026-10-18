@@ -108,6 +108,7 @@ required checks taken from a repo's last green PR, squash-only merges, secret sc
 | v2.1.0 | Terraform pipeline: `terraform-ci` (fmt, validate, TFLint, Trivy, Checkov, Infracost, plan comment), `terraform-apply`, `terraform-destroy` |
 | v3.0.0 | Terraform pipeline rebuilt (breaking): `terraform-plan` + `terraform-apply` (computed at-a-glance summary) apply the exact saved plan after approval; `terraform-destroy` removed (a destroy is a plan with `destroy: true`); AWS access through GitHub OIDC roles only, no stored keys, no runner-address handling |
 | v3.0.1 | `terraform-ci`: the plan and cost jobs read their variables correctly (a stray `}` broke them) |
+| v3.0.2 | `terraform-ci`: variables are shell-quoted when loaded for the plan and cost jobs (a JSON list lost its double quotes) |
 
 ## The Terraform workflows
 

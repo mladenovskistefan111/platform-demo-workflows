@@ -168,8 +168,9 @@ jobs:
         run: |
           set -euo pipefail
           vars="${TF_VARS_JSON:-}"; [ -n "$vars" ] || vars='{}'
-          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"$vars" > tfvars.env
-          set -a; . ./tfvars.env; set +a
+          # shell-quoted (@sh): the file is sourced, and an unquoted ["a/32"] would lose its double quotes
+          jq -r 'to_entries[] | "export TF_VAR_\(.key)=" + ((if (.value|type)=="string" then .value else (.value|tojson) end) | @sh)' <<<"$vars" > tfvars.env
+          . ./tfvars.env
           infracost breakdown --path "$COST_DIRECTORY" --format json --out-file infracost.json
           {
             echo '<!-- terraform-cost -->'
@@ -235,8 +236,9 @@ jobs:
         run: |
           set -euo pipefail
           vars="${TF_VARS_JSON:-}"; [ -n "$vars" ] || vars='{}'
-          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"$vars" > tfvars.env
-          set -a; . ./tfvars.env; set +a
+          # shell-quoted (@sh): the file is sourced, and an unquoted ["a/32"] would lose its double quotes
+          jq -r 'to_entries[] | "export TF_VAR_\(.key)=" + ((if (.value|type)=="string" then .value else (.value|tojson) end) | @sh)' <<<"$vars" > tfvars.env
+          . ./tfvars.env
           terraform -chdir="$PLAN_DIRECTORY" init -input=false -lockfile=readonly -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
           # -refresh=false: the plan compares the code with the state and does not call the cluster API (which only the maintainer's
           # is open to IAM-authenticated callers only), so it never touches the running platform.
