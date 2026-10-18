@@ -167,7 +167,8 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"${TF_VARS_JSON:-{}}" > tfvars.env
+          vars="${TF_VARS_JSON:-}"; [ -n "$vars" ] || vars='{}'
+          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"$vars" > tfvars.env
           set -a; . ./tfvars.env; set +a
           infracost breakdown --path "$COST_DIRECTORY" --format json --out-file infracost.json
           {
@@ -233,7 +234,8 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"${TF_VARS_JSON:-{}}" > tfvars.env
+          vars="${TF_VARS_JSON:-}"; [ -n "$vars" ] || vars='{}'
+          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"$vars" > tfvars.env
           set -a; . ./tfvars.env; set +a
           terraform -chdir="$PLAN_DIRECTORY" init -input=false -lockfile=readonly -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
           # -refresh=false: the plan compares the code with the state and does not call the cluster API (which only the maintainer's
