@@ -1,14 +1,13 @@
 name: Terraform apply
 
-# Reusable deployment of a Terraform root module with a human gate:
-#   Plan   shows what would change and the reason given, on the run page; changes nothing (except admitting the runner to the API list)
-#   Apply  runs in a GitHub environment, so required reviewers must approve it first; it plans again and refuses to apply unless the
-#          changes are exactly the ones that were shown. If there is nothing to change, there is nothing to approve.
-# Run it from one concurrency group per repository (the state lock would refuse a second run anyway).
+# Reusable second half of a deployment: applies the plan that terraform-plan.yaml saved, after a person approved it. It is also what
+# runs a destroy (a plan made with destroy: true).
 #
-# GitHub-hosted runners have a different public address every time, and the cluster's API endpoint only admits listed addresses.
-# So the runner's address is added to the variable named in runner_ip_variable, and, when the cluster already exists, to the
-# endpoint itself before Terraform needs it (otherwise refreshing the cluster's Helm and manifest resources would time out).
+#   Review  checks the saved plan is the one that was made for THIS commit, is recent, and was not altered; shows the reason and the plan
+#           on the run page. Read-only role. Changes nothing.
+#   Apply   runs in a GitHub environment, so its required reviewers must approve first; it applies exactly the plan that was shown (the
+#           plan file's checksum must still be the reviewed one). Terraform itself refuses a plan whose state has changed since.
+#
 # Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/terraform-apply.yaml@<sha> # <tag>
 
 on:
@@ -18,66 +17,67 @@ on:
         type: string
         default: "1.16.6"
       working_directory:
-        description: Root module to apply.
+        description: Root module the plan is for.
         type: string
-        default: envs/platform
+        required: true
       state_bucket:
-        description: S3 bucket of the remote state.
+        description: S3 bucket of the remote state, where the plan was saved.
         type: string
         required: true
       aws_region:
         type: string
         default: us-east-1
-      role_to_assume:
-        description: IAM role to assume through GitHub OIDC (empty = use the AWS_* secrets).
-        type: string
-        default: ""
-      tf_vars:
-        description: JSON object of Terraform variables (no secrets).
-        type: string
-        default: "{}"
-      runner_ip_variable:
-        description: Name of the list(string) variable the runner's address (/32) is appended to (empty = none).
-        type: string
-        default: ""
-      cluster_name:
-        description: EKS cluster name, to admit the runner to an existing cluster's API endpoint (empty = none).
-        type: string
-        default: ""
-      reason:
-        description: Why this deployment is being made; shown with the plan, where it is approved.
+      plan_role_to_assume:
+        description: Read-only IAM role (ARN) for the Review job (the one that saved the plan).
         type: string
         required: true
+      role_to_assume:
+        description: IAM role (ARN) for the Apply job. Its trust policy should admit only the GitHub environment named below.
+        type: string
+        required: true
+      plan_id:
+        description: Identifier of the saved plan (output of terraform-plan, shown on its run page).
+        type: string
+        required: true
+      destroy:
+        description: Whether this applies a destroy plan. It must match how the plan was made, so a deployment can never run a destroy plan or the reverse.
+        type: boolean
+        default: false
       environment:
         description: GitHub environment of the Apply job (approvals are configured there).
         type: string
-        default: production
-    secrets:
-      AWS_ACCESS_KEY_ID:
-        required: false
-      AWS_SECRET_ACCESS_KEY:
-        required: false
+        required: true
+      max_plan_age_hours:
+        type: number
+        default: 24
+      pre_apply_script:
+        description: Script of the calling repository to run before the apply, with the Apply job's credentials (empty = none).
+        type: string
+        default: ""
+      post_apply_script:
+        description: Script of the calling repository to run after the apply, whatever its result (empty = none).
+        type: string
+        default: ""
 
 permissions: {}
 
 jobs:
-  plan:
-    name: Plan
+  review:
+    name: Review
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     outputs:
-      has_changes: ${{ steps.plan.outputs.has_changes }}
-      changes: ${{ steps.plan.outputs.changes }}
+      tfplan_sha256: ${{ steps.verify.outputs.tfplan_sha256 }}
     env:
       WORKING_DIRECTORY: ${{ inputs.working_directory }}
       STATE_BUCKET: ${{ inputs.state_bucket }}
       AWS_REGION: ${{ inputs.aws_region }}
-      TF_VARS_JSON: ${{ inputs.tf_vars }}
-      RUNNER_IP_VARIABLE: ${{ inputs.runner_ip_variable }}
-      CLUSTER_NAME: ${{ inputs.cluster_name }}
-      REASON: ${{ inputs.reason }}
+      PLAN_ID: ${{ inputs.plan_id }}
+      DESTROY: ${{ inputs.destroy }}
+      MAX_AGE_HOURS: ${{ inputs.max_plan_age_hours }}
+      ENVIRONMENT: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -85,62 +85,91 @@ jobs:
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           aws-region: ${{ inputs.aws_region }}
-          role-to-assume: ${{ inputs.role_to_assume }}
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ inputs.plan_role_to_assume }}
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: ${{ inputs.terraform_version }}
           terraform_wrapper: false
 
-      - name: Variables and this runner's address
+      - name: Fetch the saved plan and check it
+        id: verify
         run: |
           set -euo pipefail
-          ip="$(curl -fsS --retry 3 https://checkip.amazonaws.com | tr -d '[:space:]')"
-          echo "RUNNER_IP=$ip" >> "$GITHUB_ENV"
-          vars="${TF_VARS_JSON:-}"; [ -n "$vars" ] || vars='{}'
-          if [ -n "$RUNNER_IP_VARIABLE" ]; then
-            vars="$(jq -c --arg k "$RUNNER_IP_VARIABLE" --arg ip "$ip/32" '.[$k] = (((.[$k] // []) + [$ip]) | unique)' <<<"$vars")"
-          fi
-          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"$vars" >> "$GITHUB_ENV"
-
-      - name: Admit this runner to the cluster API (if the cluster exists)
-        run: |
-          set -euo pipefail
-          [ -n "$CLUSTER_NAME" ] || exit 0
-          if ! cur="$(aws eks describe-cluster --name "$CLUSTER_NAME" --query 'cluster.resourcesVpcConfig.publicAccessCidrs' --output json 2>/dev/null)"; then
-            echo "No cluster $CLUSTER_NAME yet."; exit 0
-          fi
-          if jq -e --arg ip "$RUNNER_IP/32" 'index($ip)' <<<"$cur" >/dev/null; then exit 0; fi
-          new="$(jq -r --arg ip "$RUNNER_IP/32" '. + [$ip] | join(",")' <<<"$cur")"
-          aws eks update-cluster-config --name "$CLUSTER_NAME" --resources-vpc-config "endpointPublicAccess=true,publicAccessCidrs=$new" > /dev/null
-          aws eks wait cluster-active --name "$CLUSTER_NAME"
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$PLAN_ID" =~ ^[0-9]+-[0-9]+$ ]] || fail "plan_id '$PLAN_ID' is not a plan id (digits-digits, from the plan run's page)."
+          prefix="plans/$(basename "$WORKING_DIRECTORY")/$PLAN_ID"
+          aws s3 cp "s3://$STATE_BUCKET/$prefix/meta.json" meta.json --only-show-errors || fail "No saved plan $PLAN_ID for $WORKING_DIRECTORY (wrong id, expired after 7 days, or already applied). Run the plan again."
+          aws s3 cp "s3://$STATE_BUCKET/$prefix/tfplan" "$WORKING_DIRECTORY/tfplan" --only-show-errors
+          [ "$(jq -r .working_directory meta.json)" = "$WORKING_DIRECTORY" ] || fail "This plan is for $(jq -r .working_directory meta.json), not $WORKING_DIRECTORY."
+          [ "$(jq -r .destroy meta.json)" = "$DESTROY" ] || fail "This plan has destroy=$(jq -r .destroy meta.json); this workflow applies destroy=$DESTROY. Nothing was applied."
+          [ "$(jq -r .commit meta.json)" = "$GITHUB_SHA" ] || fail "The plan was made for commit $(jq -r .commit meta.json), but this run is on $GITHUB_SHA: the code changed after the plan. Plan again."
+          age=$(( ( $(date +%s) - $(jq -r .created_epoch meta.json) ) / 3600 ))
+          [ "$age" -lt "$MAX_AGE_HOURS" ] || fail "The plan is $age hours old (limit $MAX_AGE_HOURS). Plan again."
+          actual="$(sha256sum "$WORKING_DIRECTORY/tfplan" | cut -d' ' -f1)"
+          [ "$actual" = "$(jq -r .tfplan_sha256 meta.json)" ] || fail "The saved plan does not match its recorded checksum. Refusing to go on."
+          echo "tfplan_sha256=$actual" >> "$GITHUB_OUTPUT"
 
       - name: Init
         run: terraform -chdir="$WORKING_DIRECTORY" init -input=false -lockfile=readonly -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
 
-      - name: Plan
-        id: plan
+      - name: Show what will be applied
         run: |
           set -euo pipefail
-          set +e
-          terraform -chdir="$WORKING_DIRECTORY" plan -input=false -no-color -lock-timeout=10m -detailed-exitcode -out=tfplan > plan.txt 2>&1
-          code=$?
-          set -e
-          if [ "$code" -eq 1 ]; then cat plan.txt; exit 1; fi
-          terraform -chdir="$WORKING_DIRECTORY" show -json tfplan \
-            | jq -r '[.resource_changes[]? | select(.change.actions != ["no-op"]) | "\(.address) \(.change.actions | join(","))"] | sort | .[]' > changes.txt
-          if [ "$code" -eq 2 ]; then echo "has_changes=true" >> "$GITHUB_OUTPUT"; else echo "has_changes=false" >> "$GITHUB_OUTPUT"; fi
-          { echo "changes<<END_OF_CHANGES"; cat changes.txt; echo "END_OF_CHANGES"; } >> "$GITHUB_OUTPUT"
+          terraform -chdir="$WORKING_DIRECTORY" show -no-color tfplan > plan.txt
+          terraform -chdir="$WORKING_DIRECTORY" show -json tfplan > plan.json
+          jq -r '[.resource_changes[]? | select(.change.actions != ["no-op"]) | "\(.address)  \(.change.actions | join(","))"] | sort | .[]' plan.json > changes.txt
+          # The plain summary: counts, anything destroyed or replaced first, which settings change on updates. Computed, not guessed.
+          jq -r '
+            def kind:
+              .change.actions as $a
+              | if $a == ["create"] then "create"
+                elif $a == ["update"] then "update"
+                elif $a == ["delete"] then "destroy"
+                elif ($a | index("delete")) and ($a | index("create")) then "replace"
+                else "other" end;
+            def changed:
+              (.change.before // {}) as $b | (.change.after // {}) as $a
+              | [($a | keys[]) | select(($b[.] // null) != $a[.])];
+            def counts: [group_by(.kind)[] | "\(length) \(.[0].kind)"] | join(", ");
+            [.resource_changes[]? | select(.change.actions != ["no-op"] and .change.actions != ["read"])
+              | {address, type, kind: kind, changed: changed,
+                 module: ((.module_address // "root") | split(".") | if .[0] == "module" then .[1] else "root" end)}] as $r
+            | "Totals: \($r | counts)",
+              "",
+              ([$r[] | select(.kind == "destroy" or .kind == "replace")]
+                | if length > 0
+                  then "Needs attention (destroyed or replaced):", (.[] | "- \(.kind | ascii_upcase): \(.address)"), ""
+                  else "No resource is destroyed or replaced.", "" end),
+              ([$r[] | select(.kind == "update")]
+                | if length > 0
+                  then "Updated in place:", (.[] | "- \(.address): changes \(.changed | .[0:8] | join(", "))"), ""
+                  else empty end),
+              ([$r[] | select(.kind == "create")]
+                | if length > 0
+                  then "Created, by type: " + ([group_by(.type)[] | "\(.[0].type) x\(length)"] | join(", ")), ""
+                  else empty end),
+              "By module:",
+              ($r | group_by(.module)[] | "- \(.[0].module): \(counts)")
+          ' plan.json > glance.txt
           line="$(grep -E '^(Plan:|No changes)' plan.txt | head -1 || true)"
           {
-            echo "## Plan: what this deployment would change"
+            if [ "$DESTROY" = "true" ]; then echo "## Review: this will DESTROY"; else echo "## Review: this will be applied"; fi
             echo
-            echo "**Reason given:** $REASON"
+            echo "**Reason:** $(jq -r .reason meta.json)"
             echo
-            echo "**Result:** ${line:-see the plan below}"
+            echo "**Planned by:** $(jq -r .actor meta.json), commit \`$(jq -r .commit meta.json | cut -c1-7)\`, [plan run]($(jq -r .run_url meta.json))"
             echo
-            echo "Nothing has been changed yet. The next job waits for an approval: read this plan and the reason first."
+            echo "**Result:** ${line:-see below}"
+            echo
+            echo "Nothing has been changed yet. Read this, then approve or reject the **Apply** job (environment: $ENVIRONMENT)."
+            echo
+            echo "### At a glance"
+            echo
+            echo '```'
+            cat glance.txt
+            echo '```'
+            echo
+            echo "### Every change"
             echo
             echo '```'
             cat changes.txt
@@ -149,7 +178,7 @@ jobs:
             echo "<details><summary>Full plan</summary>"
             echo
             echo '```hcl'
-            head -c 800000 plan.txt
+            head -c 500000 plan.txt
             echo
             echo '```'
             echo "</details>"
@@ -157,8 +186,7 @@ jobs:
 
   apply:
     name: Apply
-    needs: plan
-    if: needs.plan.outputs.has_changes == 'true'
+    needs: review
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     permissions:
@@ -168,11 +196,10 @@ jobs:
       WORKING_DIRECTORY: ${{ inputs.working_directory }}
       STATE_BUCKET: ${{ inputs.state_bucket }}
       AWS_REGION: ${{ inputs.aws_region }}
-      TF_VARS_JSON: ${{ inputs.tf_vars }}
-      RUNNER_IP_VARIABLE: ${{ inputs.runner_ip_variable }}
-      CLUSTER_NAME: ${{ inputs.cluster_name }}
-      REASON: ${{ inputs.reason }}
-      APPROVED: ${{ needs.plan.outputs.changes }}
+      PLAN_ID: ${{ inputs.plan_id }}
+      REVIEWED_SHA256: ${{ needs.review.outputs.tfplan_sha256 }}
+      PRE_APPLY_SCRIPT: ${{ inputs.pre_apply_script }}
+      POST_APPLY_SCRIPT: ${{ inputs.post_apply_script }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -181,51 +208,28 @@ jobs:
         with:
           aws-region: ${{ inputs.aws_region }}
           role-to-assume: ${{ inputs.role_to_assume }}
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: ${{ inputs.terraform_version }}
           terraform_wrapper: false
 
-      - name: Variables and this runner's address
+      - name: Fetch the plan that was reviewed
         run: |
           set -euo pipefail
-          ip="$(curl -fsS --retry 3 https://checkip.amazonaws.com | tr -d '[:space:]')"
-          echo "RUNNER_IP=$ip" >> "$GITHUB_ENV"
-          vars="${TF_VARS_JSON:-}"; [ -n "$vars" ] || vars='{}'
-          if [ -n "$RUNNER_IP_VARIABLE" ]; then
-            vars="$(jq -c --arg k "$RUNNER_IP_VARIABLE" --arg ip "$ip/32" '.[$k] = (((.[$k] // []) + [$ip]) | unique)' <<<"$vars")"
+          prefix="plans/$(basename "$WORKING_DIRECTORY")/$PLAN_ID"
+          aws s3 cp "s3://$STATE_BUCKET/$prefix/tfplan" "$WORKING_DIRECTORY/tfplan" --only-show-errors
+          actual="$(sha256sum "$WORKING_DIRECTORY/tfplan" | cut -d' ' -f1)"
+          if [ "$actual" != "$REVIEWED_SHA256" ]; then
+            echo "::error::The saved plan changed after it was reviewed. Nothing was applied. Plan again."
+            exit 1
           fi
-          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"$vars" >> "$GITHUB_ENV"
-
-      - name: Admit this runner to the cluster API (if the cluster exists)
-        run: |
-          set -euo pipefail
-          [ -n "$CLUSTER_NAME" ] || exit 0
-          if ! cur="$(aws eks describe-cluster --name "$CLUSTER_NAME" --query 'cluster.resourcesVpcConfig.publicAccessCidrs' --output json 2>/dev/null)"; then
-            echo "No cluster $CLUSTER_NAME yet."; exit 0
-          fi
-          if jq -e --arg ip "$RUNNER_IP/32" 'index($ip)' <<<"$cur" >/dev/null; then exit 0; fi
-          new="$(jq -r --arg ip "$RUNNER_IP/32" '. + [$ip] | join(",")' <<<"$cur")"
-          aws eks update-cluster-config --name "$CLUSTER_NAME" --resources-vpc-config "endpointPublicAccess=true,publicAccessCidrs=$new" > /dev/null
-          aws eks wait cluster-active --name "$CLUSTER_NAME"
 
       - name: Init
         run: terraform -chdir="$WORKING_DIRECTORY" init -input=false -lockfile=readonly -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
 
-      - name: Plan again and compare with what was approved
-        run: |
-          set -euo pipefail
-          terraform -chdir="$WORKING_DIRECTORY" plan -input=false -no-color -lock-timeout=10m -out=tfplan > plan.txt 2>&1 || { cat plan.txt; exit 1; }
-          terraform -chdir="$WORKING_DIRECTORY" show -json tfplan \
-            | jq -r '[.resource_changes[]? | select(.change.actions != ["no-op"]) | "\(.address) \(.change.actions | join(","))"] | sort | .[]' > changes.txt
-          printf '%s\n' "$APPROVED" | sort > approved.txt
-          if ! diff -u approved.txt changes.txt; then
-            echo "::error::The changes are no longer the ones that were approved (see the diff above). Nothing was applied. Run the workflow again to review the new plan."
-            exit 1
-          fi
-          echo "The plan is the approved one: $(wc -l < changes.txt) resource changes."
+      - name: Before the apply
+        if: env.PRE_APPLY_SCRIPT != ''
+        run: bash "$PRE_APPLY_SCRIPT"
 
       - name: Apply
         run: terraform -chdir="$WORKING_DIRECTORY" apply -input=false -no-color -lock-timeout=10m tfplan
@@ -233,11 +237,17 @@ jobs:
       - name: Outputs
         run: |
           {
-            echo '### Deployed'
-            echo
-            echo "Reason: $REASON"
+            echo '### Applied'
             echo
             echo '```'
-            terraform -chdir="$WORKING_DIRECTORY" output -no-color
+            terraform -chdir="$WORKING_DIRECTORY" output -no-color || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: After the apply
+        if: always() && env.POST_APPLY_SCRIPT != ''
+        run: bash "$POST_APPLY_SCRIPT"
+
+      - name: Remove the used plan
+        if: success()
+        run: aws s3 rm "s3://$STATE_BUCKET/plans/$(basename "$WORKING_DIRECTORY")/$PLAN_ID/" --recursive --only-show-errors

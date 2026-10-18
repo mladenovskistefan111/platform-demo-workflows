@@ -15,8 +15,8 @@ copy of a 300-line pipeline, so a fix or a version bump lands once. Current rele
 | [`secret-scan.yaml`](.github/workflows/secret-scan.yaml) | stand-alone gitleaks scan (the pull request's commits; full history on manual runs) | helm, observability, product-catalog-db |
 | [`workflow-lint.yaml`](.github/workflows/workflow-lint.yaml) | actionlint (+ shellcheck on CI runners) and "every `uses:` is pinned to a full commit SHA" | every repo (this one included) |
 | [`terraform-ci.yaml`](.github/workflows/terraform-ci.yaml) | `fmt` + `validate`, TFLint, Trivy config scan, Checkov, Infracost monthly estimate (needs a free `INFRACOST_API_KEY`), `terraform plan` as a PR comment (no refresh, never touches the running platform) | infra-terraform |
-| [`terraform-apply.yaml`](.github/workflows/terraform-apply.yaml) | **Plan** job (what changes + the reason, on the run page), then an **Apply** job that waits for a reviewer's approval, plans again and refuses to apply unless the changes are exactly the approved ones | infra-terraform |
-| [`terraform-destroy.yaml`](.github/workflows/terraform-destroy.yaml) | typed confirmation, a **Plan** of everything that would be destroyed (+ reason), reviewer approval, then empties the cluster (Argo CD apps, PVCs, LoadBalancer Services), destroys exactly the approved resources, and lists leftovers (EBS volumes, classic load balancers) | infra-terraform |
+| [`terraform-plan.yaml`](.github/workflows/terraform-plan.yaml) | plans a root module (or its destruction), saves the plan encrypted in the state bucket (7 days), shows the reason and the changes on the run page; changes nothing | infra-terraform |
+| [`terraform-apply.yaml`](.github/workflows/terraform-apply.yaml) | **Review** job (checks the saved plan belongs to this commit, is recent and unaltered; shows reason, an "at a glance" summary computed by script with anything destroyed or replaced first, and the plan), then an **Apply** job in a GitHub environment that waits for a reviewer and applies exactly the reviewed plan. Also runs destroy plans, with optional before/after scripts | infra-terraform |
 
 Every language workflow has the same job names (`Lint & Format`, `Secret Scan`, `Build Check`, `Unit Tests`,
 `SCA - Dependency Vulnerabilities`, `SAST - Static Security Analysis`), so branch protection looks the same everywhere. In a
@@ -106,19 +106,20 @@ required checks taken from a repo's last green PR, squash-only merges, secret sc
 | v2.0.1 | classic cosign signature format (Docker Hub has no referrers API) |
 | v2.0.2 | secret scan runs the open-source **gitleaks CLI** (pinned, SHA-256 checked) instead of `gitleaks-action`, whose license is paid for organisation-owned repositories; the cosign self-verification accepts the workflows repo under both owners (`mladenovskistefan111`, `platform-boutique`) |
 | v2.1.0 | Terraform pipeline: `terraform-ci` (fmt, validate, TFLint, Trivy, Checkov, Infracost, plan comment), `terraform-apply`, `terraform-destroy` |
+| v3.0.0 | Terraform pipeline rebuilt (breaking): `terraform-plan` + `terraform-apply` (computed at-a-glance summary) apply the exact saved plan after approval; `terraform-destroy` removed (a destroy is a plan with `destroy: true`); AWS access through GitHub OIDC roles only, no stored keys, no runner-address handling |
 
 ## The Terraform workflows
 
-- **Credentials:** the callers pass `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` as secrets, or set `role_to_assume` to use GitHub OIDC
-  (no stored keys; the preferred end state). Pull requests from forks never get them.
-- **Approvals:** both split into a read-only **Plan** job and an **Apply**/**Destroy** job in a GitHub environment (`environment` input; put
-  required reviewers on it). The plan and the required `reason` are on the run page before the approval; after it, the job plans again and
-  stops unless the list of changes is identical to the approved one. A run with nothing to change asks for no approval. Destroy additionally
-  needs a typed confirmation. (The Plan job's only side effect: it admits the runner's address to the cluster API list.)
+- **Credentials:** GitHub OIDC only. The caller passes the ARN of a read-only role for plans and reviews, and of an apply role for the
+  Apply job; nothing secret is stored. The apply role's trust policy should admit only the GitHub environment the Apply job runs in.
+- **Plan, then apply that plan:** `terraform-plan` saves the plan in the state bucket under `plans/<stack>/<plan id>/` (not as an artifact:
+  artifacts of a public repository are public, and a plan file can hold secret values). `terraform-apply` is started with the plan id.
+  Its Review job refuses a plan that is for another directory, another commit, older than `max_plan_age_hours`, of the wrong kind
+  (`destroy` must match), or whose checksum differs; it shows the reason and the plan on the run page. The Apply job waits for the
+  environment's reviewers, re-checks the checksum, applies, and deletes the plan. Terraform itself rejects a plan whose state changed.
+- **Destroy** is a plan with `destroy: true` applied with `destroy: true`; `pre_apply_script` and `post_apply_script` (paths in the calling
+  repository) empty the cluster before and list leftovers after. A deployment can never apply a destroy plan, nor the reverse.
 - **Accepted risks** are written down next to the scanners' configuration in the calling repository (`.trivyignore.yaml`, `.checkov.yaml`,
   each entry with its reason); a scan that fails is never silenced without one.
-- **The cluster API** admits only listed addresses. A GitHub-hosted runner has a new address on every run, so `terraform-apply` and
-  `terraform-destroy` add it to the variable named in `runner_ip_variable` and, if the cluster exists, to the endpoint before Terraform
-  refreshes the cluster's Helm and manifest resources. The pull-request plan does not refresh, so it needs no such access.
+- **The pull-request plan** does not refresh, so it never touches the running platform.
 - **Cost estimate:** Infracost shows on-demand prices and no usage-based items (NAT data, load balancer traffic, logs).
-

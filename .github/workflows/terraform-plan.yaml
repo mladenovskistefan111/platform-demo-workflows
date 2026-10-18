@@ -1,0 +1,162 @@
+name: Terraform plan
+
+# Reusable first half of a deployment: plans a Terraform root module, keeps the plan, and shows what it would change and why.
+# Changes nothing in AWS. The second half, terraform-apply.yaml, applies THIS saved plan once a person approved it.
+#
+# The plan is saved in the Terraform state bucket (encrypted, expires after 7 days), not as a workflow artifact: the repository is public,
+# so artifacts are downloadable by anyone, and a plan file can contain secret values. The run page shows only the readable plan, in
+# which Terraform has already hidden values it knows are sensitive.
+#
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/terraform-plan.yaml@<sha> # <tag>
+# AWS access is GitHub OIDC only: role_to_assume is a read-only role that may write the state lock and plans/ in the bucket.
+
+on:
+  workflow_call:
+    inputs:
+      terraform_version:
+        type: string
+        default: "1.16.6"
+      working_directory:
+        description: Root module to plan.
+        type: string
+        required: true
+      state_bucket:
+        description: S3 bucket of the remote state; the plan is saved there under plans/.
+        type: string
+        required: true
+      aws_region:
+        type: string
+        default: us-east-1
+      role_to_assume:
+        description: IAM role (ARN) to assume through GitHub OIDC for the plan.
+        type: string
+        required: true
+      tf_vars:
+        description: JSON object of Terraform variables (no secrets).
+        type: string
+        default: "{}"
+      reason:
+        description: Why this change is being made; shown with the plan, where it is approved.
+        type: string
+        required: true
+      destroy:
+        description: Plan the destruction of everything in the root module.
+        type: boolean
+        default: false
+    outputs:
+      plan_id:
+        description: Identifier of the saved plan (empty when there is nothing to change); give it to terraform-apply.
+        value: ${{ jobs.plan.outputs.plan_id }}
+      has_changes:
+        description: "true when the plan changes something."
+        value: ${{ jobs.plan.outputs.has_changes }}
+
+permissions: {}
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      plan_id: ${{ steps.save.outputs.plan_id }}
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+    env:
+      WORKING_DIRECTORY: ${{ inputs.working_directory }}
+      STATE_BUCKET: ${{ inputs.state_bucket }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      TF_VARS_JSON: ${{ inputs.tf_vars }}
+      REASON: ${{ inputs.reason }}
+      DESTROY: ${{ inputs.destroy }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ inputs.role_to_assume }}
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Variables
+        run: |
+          set -euo pipefail
+          vars="${TF_VARS_JSON:-}"; [ -n "$vars" ] || vars='{}'
+          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"$vars" >> "$GITHUB_ENV"
+
+      - name: Init
+        run: terraform -chdir="$WORKING_DIRECTORY" init -input=false -lockfile=readonly -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
+
+      - name: Plan
+        id: plan
+        run: |
+          set -euo pipefail
+          flags=()
+          [ "$DESTROY" = "true" ] && flags+=(-destroy)
+          set +e
+          terraform -chdir="$WORKING_DIRECTORY" plan "${flags[@]}" -input=false -no-color -lock-timeout=10m -detailed-exitcode -out=tfplan > plan.log 2>&1
+          code=$?
+          set -e
+          if [ "$code" -eq 1 ]; then cat plan.log; exit 1; fi
+          if [ "$code" -eq 2 ]; then echo "has_changes=true" >> "$GITHUB_OUTPUT"; else echo "has_changes=false" >> "$GITHUB_OUTPUT"; fi
+          terraform -chdir="$WORKING_DIRECTORY" show -no-color tfplan > plan.txt
+          terraform -chdir="$WORKING_DIRECTORY" show -json tfplan \
+            | jq -r '[.resource_changes[]? | select(.change.actions != ["no-op"]) | "\(.address)  \(.change.actions | join(","))"] | sort | .[]' > changes.txt
+
+      - name: Save the plan
+        id: save
+        if: steps.plan.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+          plan_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          stack="$(basename "$WORKING_DIRECTORY")"
+          prefix="plans/$stack/$plan_id"
+          sha="$(sha256sum "$WORKING_DIRECTORY/tfplan" | cut -d' ' -f1)"
+          jq -n \
+            --arg plan_id "$plan_id" --arg working_directory "$WORKING_DIRECTORY" --argjson destroy "$DESTROY" \
+            --arg reason "$REASON" --arg commit "$GITHUB_SHA" --arg ref "$GITHUB_REF" --arg actor "$GITHUB_ACTOR" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --argjson created_epoch "$(date +%s)" --arg tfplan_sha256 "$sha" \
+            '{plan_id: $plan_id, working_directory: $working_directory, destroy: $destroy, reason: $reason, commit: $commit, ref: $ref, actor: $actor, run_url: $run_url, created_epoch: $created_epoch, tfplan_sha256: $tfplan_sha256}' > meta.json
+          aws s3 cp "$WORKING_DIRECTORY/tfplan" "s3://$STATE_BUCKET/$prefix/tfplan" --only-show-errors
+          aws s3 cp meta.json "s3://$STATE_BUCKET/$prefix/meta.json" --only-show-errors
+          echo "plan_id=$plan_id" >> "$GITHUB_OUTPUT"
+
+      - name: Run page
+        if: always() && steps.plan.outcome == 'success'
+        env:
+          HAS_CHANGES: ${{ steps.plan.outputs.has_changes }}
+          PLAN_ID: ${{ steps.save.outputs.plan_id }}
+        run: |
+          set -euo pipefail
+          line="$(grep -E '^(Plan:|No changes)' plan.txt | head -1 || true)"
+          {
+            if [ "$DESTROY" = "true" ]; then echo "## Plan: everything this would DESTROY"; else echo "## Plan: what this would change"; fi
+            echo
+            echo "**Reason given:** $REASON"
+            echo
+            echo "**Result:** ${line:-see the plan below}"
+            echo
+            if [ "$HAS_CHANGES" = "true" ]; then
+              echo "Nothing has been changed. Plan id: \`$PLAN_ID\` (saved for 7 days). The next jobs review this exact plan, and the apply waits for approval by a reviewer. A caller that stops here can apply it later by passing the plan id to terraform-apply."
+              echo
+              echo '```'
+              cat changes.txt
+              echo '```'
+              echo
+              echo "<details><summary>Full plan</summary>"
+              echo
+              echo '```hcl'
+              head -c 500000 plan.txt
+              echo
+              echo '```'
+              echo "</details>"
+            else
+              echo "Nothing to change, so there is nothing to apply."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
