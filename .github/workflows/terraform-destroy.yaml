@@ -1,0 +1,180 @@
+name: Terraform destroy
+
+# Reusable teardown of a Terraform root module, for the cost of leaving it running. Deliberately hard to trigger by accident:
+#   1. the caller passes what the person typed (confirmation) and what it must be (expected_confirmation); anything else stops here
+#   2. the destroy job runs in a GitHub environment, so required reviewers make it wait for an approval
+# Before Terraform destroys anything, what runs INSIDE the cluster is removed (Argo CD's applications, the PersistentVolumeClaims and any
+# Service of type LoadBalancer): Terraform cannot see those, and EBS volumes or load balancers that Kubernetes created would be left
+# behind and block the VPC. Afterwards a check lists what is still there.
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/terraform-destroy.yaml@<sha> # <tag>
+
+on:
+  workflow_call:
+    inputs:
+      confirmation:
+        description: What the person typed.
+        type: string
+        required: true
+      expected_confirmation:
+        description: What it has to be.
+        type: string
+        required: true
+      terraform_version:
+        type: string
+        default: "1.16.6"
+      working_directory:
+        description: Root module to destroy.
+        type: string
+        default: envs/platform
+      state_bucket:
+        description: S3 bucket of the remote state.
+        type: string
+        required: true
+      aws_region:
+        type: string
+        default: us-east-1
+      role_to_assume:
+        description: IAM role to assume through GitHub OIDC (empty = use the AWS_* secrets).
+        type: string
+        default: ""
+      tf_vars:
+        description: JSON object of Terraform variables (no secrets).
+        type: string
+        default: "{}"
+      runner_ip_variable:
+        description: Name of the list(string) variable the runner's address (/32) is appended to (empty = none).
+        type: string
+        default: ""
+      cluster_name:
+        description: EKS cluster name, to admit the runner to its API endpoint and drain it first (empty = no cluster work).
+        type: string
+        default: ""
+      delete_leftover_volumes:
+        description: Delete unattached EBS volumes the EBS CSI driver created (tag ebs.csi.aws.com/cluster=true) after the destroy.
+        type: boolean
+        default: false
+      environment:
+        description: GitHub environment of the job (approvals are configured there).
+        type: string
+        default: destruction
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+
+permissions: {}
+
+jobs:
+  confirm:
+    name: Confirm
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      GOT: ${{ inputs.confirmation }}
+      WANT: ${{ inputs.expected_confirmation }}
+    steps:
+      - name: Typed confirmation matches
+        run: |
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::Nothing was destroyed: the confirmation does not match. Type exactly: $WANT"
+            exit 1
+          fi
+
+  destroy:
+    name: Destroy
+    needs: confirm
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      WORKING_DIRECTORY: ${{ inputs.working_directory }}
+      STATE_BUCKET: ${{ inputs.state_bucket }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      TF_VARS_JSON: ${{ inputs.tf_vars }}
+      RUNNER_IP_VARIABLE: ${{ inputs.runner_ip_variable }}
+      CLUSTER_NAME: ${{ inputs.cluster_name }}
+      DELETE_VOLUMES: ${{ inputs.delete_leftover_volumes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ inputs.role_to_assume }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Variables and this runner's address
+        run: |
+          set -euo pipefail
+          ip="$(curl -fsS --retry 3 https://checkip.amazonaws.com | tr -d '[:space:]')"
+          echo "RUNNER_IP=$ip" >> "$GITHUB_ENV"
+          vars="${TF_VARS_JSON:-}"; [ -n "$vars" ] || vars='{}'
+          if [ -n "$RUNNER_IP_VARIABLE" ]; then
+            vars="$(jq -c --arg k "$RUNNER_IP_VARIABLE" --arg ip "$ip/32" '.[$k] = (((.[$k] // []) + [$ip]) | unique)' <<<"$vars")"
+          fi
+          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"$vars" >> "$GITHUB_ENV"
+
+      - name: Admit this runner to the cluster API (if the cluster exists)
+        run: |
+          set -euo pipefail
+          [ -n "$CLUSTER_NAME" ] || exit 0
+          if ! cur="$(aws eks describe-cluster --name "$CLUSTER_NAME" --query 'cluster.resourcesVpcConfig.publicAccessCidrs' --output json 2>/dev/null)"; then
+            echo "No cluster $CLUSTER_NAME (already gone?)."; exit 0
+          fi
+          if jq -e --arg ip "$RUNNER_IP/32" 'index($ip)' <<<"$cur" >/dev/null; then exit 0; fi
+          new="$(jq -r --arg ip "$RUNNER_IP/32" '. + [$ip] | join(",")' <<<"$cur")"
+          aws eks update-cluster-config --name "$CLUSTER_NAME" --resources-vpc-config "endpointPublicAccess=true,publicAccessCidrs=$new" > /dev/null
+          aws eks wait cluster-active --name "$CLUSTER_NAME"
+
+      - name: Remove what runs inside the cluster
+        run: |
+          [ -n "$CLUSTER_NAME" ] || exit 0
+          aws eks describe-cluster --name "$CLUSTER_NAME" > /dev/null 2>&1 || exit 0
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+          # Best effort from here: whatever cannot be removed is reported by the leftover check below.
+          if kubectl get ns argocd > /dev/null 2>&1; then
+            # ApplicationSets first (they would re-create Applications), then the Applications: their finalizers prune what they deployed.
+            kubectl -n argocd delete applicationsets --all --timeout=2m || true
+            kubectl -n argocd delete applications --all --wait=true --timeout=10m || true
+          fi
+          kubectl delete pvc --all --all-namespaces --timeout=5m || true
+          kubectl get svc --all-namespaces --field-selector spec.type=LoadBalancer -o json \
+            | jq -r '.items[] | "\(.metadata.namespace) \(.metadata.name)"' \
+            | while read -r ns name; do kubectl -n "$ns" delete svc "$name" --timeout=2m || true; done
+
+      - name: Init
+        run: terraform -chdir="$WORKING_DIRECTORY" init -input=false -lockfile=readonly -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
+
+      - name: Destroy
+        run: terraform -chdir="$WORKING_DIRECTORY" destroy -input=false -no-color -auto-approve -lock-timeout=10m
+
+      - name: Leftovers
+        if: always()
+        run: |
+          {
+            echo '### What is still in the account after the destroy'
+            echo
+            vols="$(aws ec2 describe-volumes --filters Name=tag:ebs.csi.aws.com/cluster,Values=true --query 'Volumes[].[VolumeId,State,Size]' --output text)"
+            if [ -n "$vols" ]; then
+              echo "EBS volumes created by the EBS CSI driver (volume, state, GiB):"; echo '```'; echo "$vols"; echo '```'
+              echo "::warning::EBS volumes created by the EBS CSI driver still exist."
+              if [ "$DELETE_VOLUMES" = "true" ]; then
+                for v in $(aws ec2 describe-volumes --filters Name=tag:ebs.csi.aws.com/cluster,Values=true Name=status,Values=available --query 'Volumes[].VolumeId' --output text); do
+                  aws ec2 delete-volume --volume-id "$v" && echo "deleted $v"
+                done
+              fi
+            else
+              echo "- no EBS volumes from the EBS CSI driver"
+            fi
+            elbs="$(aws elb describe-load-balancers --query 'LoadBalancerDescriptions[].LoadBalancerName' --output text)"
+            if [ -n "$elbs" ]; then echo "- classic load balancers: $elbs"; echo "::warning::Classic load balancers exist (Kubernetes creates these for Services of type LoadBalancer)."; else echo "- no classic load balancers"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
