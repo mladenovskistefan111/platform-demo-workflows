@@ -6,6 +6,7 @@ metadata:
   description: "Reusable CI/CD workflows shared by every repository: build, test, scan, sign and promote images; plus the tools that generate and bump them."
   annotations:
     github.com/project-slug: platform-boutique/platform-demo-workflows
+    backstage.io/source-location: url:https://github.com/platform-boutique/platform-demo-workflows/tree/main/
     backstage.io/techdocs-ref: dir:.
   tags: [github-actions, ci, cosign]
   links:
