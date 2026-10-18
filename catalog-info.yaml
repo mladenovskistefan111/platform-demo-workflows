@@ -1,0 +1,22 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: platform-demo-workflows
+  title: platform-demo-workflows
+  description: "Reusable CI/CD workflows shared by every repository: build, test, scan, sign and promote images; plus the tools that generate and bump them."
+  annotations:
+    github.com/project-slug: platform-boutique/platform-demo-workflows
+    backstage.io/source-location: url:https://github.com/platform-boutique/platform-demo-workflows/tree/main/
+    backstage.io/techdocs-ref: dir:.
+  tags: [github-actions, ci, cosign]
+  links:
+    - { url: "https://github.com/platform-boutique/platform-demo-workflows", title: "Repository", icon: github }
+    - { url: "https://github.com/platform-boutique/platform-demo-workflows/actions", title: "Actions", icon: github }
+spec:
+  type: ci-library
+  lifecycle: experimental
+  owner: group:default/maintainers
+  system: delivery
+  dependsOn:
+    - resource:default/docker-hub
+    - resource:default/github-organisation
