@@ -106,7 +106,7 @@ required checks taken from a repo's last green PR, squash-only merges, secret sc
 | v2.0.1 | classic cosign signature format (Docker Hub has no referrers API) |
 | v2.0.2 | secret scan runs the open-source **gitleaks CLI** (pinned, SHA-256 checked) instead of `gitleaks-action`, whose license is paid for organisation-owned repositories; the cosign self-verification accepts the workflows repo under both owners (`mladenovskistefan111`, `platform-boutique`) |
 | v2.1.0 | Terraform pipeline: `terraform-ci` (fmt, validate, TFLint, Trivy, Checkov, Infracost, plan comment), `terraform-apply`, `terraform-destroy` |
-| v3.0.0 | Terraform pipeline rebuilt (breaking): `terraform-plan` + `terraform-apply` apply the exact saved plan after approval; `terraform-destroy` removed (a destroy is a plan with `destroy: true`); AWS access through GitHub OIDC roles only, no stored keys, no runner-address handling |
+| v3.0.0 | Terraform pipeline rebuilt (breaking): `terraform-plan` + `terraform-apply` (computed at-a-glance summary) apply the exact saved plan after approval; `terraform-destroy` removed (a destroy is a plan with `destroy: true`); AWS access through GitHub OIDC roles only, no stored keys, no runner-address handling |
 
 ## The Terraform workflows
 
@@ -117,10 +117,6 @@ required checks taken from a repo's last green PR, squash-only merges, secret sc
   Its Review job refuses a plan that is for another directory, another commit, older than `max_plan_age_hours`, of the wrong kind
   (`destroy` must match), or whose checksum differs; it shows the reason and the plan on the run page. The Apply job waits for the
   environment's reviewers, re-checks the checksum, applies, and deletes the plan. Terraform itself rejects a plan whose state changed.
-- **AI explanation (optional):** with an `ANTHROPIC_API_KEY` secret passed by the caller, an advisory job asks a small Claude model
-  (`ai_model`, default `claude-haiku-5-5`, effort low) to explain the at-a-glance summary in plain words. It sees names and counts only,
-  never attribute values; the reason text and the summary are marked as data, not instructions. The apply job does not wait for it and its
-  failure changes nothing; without the secret it is skipped, like the Infracost job. Approve from the list of changes, not from the AI text.
 - **Destroy** is a plan with `destroy: true` applied with `destroy: true`; `pre_apply_script` and `post_apply_script` (paths in the calling
   repository) empty the cluster before and list leftovers after. A deployment can never apply a destroy plan, nor the reverse.
 - **Accepted risks** are written down next to the scanners' configuration in the calling repository (`.trivyignore.yaml`, `.checkov.yaml`,
