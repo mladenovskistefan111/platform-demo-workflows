@@ -15,8 +15,8 @@ copy of a 300-line pipeline, so a fix or a version bump lands once. Current rele
 | [`secret-scan.yaml`](.github/workflows/secret-scan.yaml) | stand-alone gitleaks scan (the pull request's commits; full history on manual runs) | helm, observability, product-catalog-db |
 | [`workflow-lint.yaml`](.github/workflows/workflow-lint.yaml) | actionlint (+ shellcheck on CI runners) and "every `uses:` is pinned to a full commit SHA" | every repo (this one included) |
 | [`terraform-ci.yaml`](.github/workflows/terraform-ci.yaml) | `fmt` + `validate`, TFLint, Trivy config scan, Checkov, Infracost monthly estimate (needs a free `INFRACOST_API_KEY`), `terraform plan` as a PR comment (no refresh, never touches the running platform) | infra-terraform |
-| [`terraform-apply.yaml`](.github/workflows/terraform-apply.yaml) | init on the remote state, plan, apply the saved plan; runs in a GitHub environment (approval); admits the runner's address to the cluster API | infra-terraform |
-| [`terraform-destroy.yaml`](.github/workflows/terraform-destroy.yaml) | typed confirmation + environment approval, then empties the cluster (Argo CD apps, PVCs, LoadBalancer Services), `terraform destroy`, and lists leftovers (EBS volumes, classic load balancers) | infra-terraform |
+| [`terraform-apply.yaml`](.github/workflows/terraform-apply.yaml) | **Plan** job (what changes + the reason, on the run page), then an **Apply** job that waits for a reviewer's approval, plans again and refuses to apply unless the changes are exactly the approved ones | infra-terraform |
+| [`terraform-destroy.yaml`](.github/workflows/terraform-destroy.yaml) | typed confirmation, a **Plan** of everything that would be destroyed (+ reason), reviewer approval, then empties the cluster (Argo CD apps, PVCs, LoadBalancer Services), destroys exactly the approved resources, and lists leftovers (EBS volumes, classic load balancers) | infra-terraform |
 
 Every language workflow has the same job names (`Lint & Format`, `Secret Scan`, `Build Check`, `Unit Tests`,
 `SCA - Dependency Vulnerabilities`, `SAST - Static Security Analysis`), so branch protection looks the same everywhere. In a
@@ -111,8 +111,10 @@ required checks taken from a repo's last green PR, squash-only merges, secret sc
 
 - **Credentials:** the callers pass `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` as secrets, or set `role_to_assume` to use GitHub OIDC
   (no stored keys; the preferred end state). Pull requests from forks never get them.
-- **Approvals:** `terraform-apply` and `terraform-destroy` run in a GitHub environment (`environment` input); put required reviewers on it
-  and the job waits for them. Destroy additionally needs a typed confirmation.
+- **Approvals:** both split into a read-only **Plan** job and an **Apply**/**Destroy** job in a GitHub environment (`environment` input; put
+  required reviewers on it). The plan and the required `reason` are on the run page before the approval; after it, the job plans again and
+  stops unless the list of changes is identical to the approved one. A run with nothing to change asks for no approval. Destroy additionally
+  needs a typed confirmation. (The Plan job's only side effect: it admits the runner's address to the cluster API list.)
 - **Accepted risks** are written down next to the scanners' configuration in the calling repository (`.trivyignore.yaml`, `.checkov.yaml`,
   each entry with its reason); a scan that fails is never silenced without one.
 - **The cluster API** admits only listed addresses. A GitHub-hosted runner has a new address on every run, so `terraform-apply` and
