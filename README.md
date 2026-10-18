@@ -14,6 +14,9 @@ copy of a 300-line pipeline, so a fix or a version bump lands once. Current rele
 | [`docker-promote.yaml`](.github/workflows/docker-promote.yaml) | copy the scanned digest to Docker Hub (no rebuild), tag, cosign-sign, self-verify, attach the SBOM as a signed `spdxjson` attestation, self-verify; refuses commits not on `main` | every service |
 | [`secret-scan.yaml`](.github/workflows/secret-scan.yaml) | stand-alone gitleaks scan (the pull request's commits; full history on manual runs) | helm, observability, product-catalog-db |
 | [`workflow-lint.yaml`](.github/workflows/workflow-lint.yaml) | actionlint (+ shellcheck on CI runners) and "every `uses:` is pinned to a full commit SHA" | every repo (this one included) |
+| [`terraform-ci.yaml`](.github/workflows/terraform-ci.yaml) | `fmt` + `validate`, TFLint, Trivy config scan, Checkov, Infracost monthly estimate (needs a free `INFRACOST_API_KEY`), `terraform plan` as a PR comment (no refresh, never touches the running platform) | infra-terraform |
+| [`terraform-apply.yaml`](.github/workflows/terraform-apply.yaml) | **Plan** job (what changes + the reason, on the run page), then an **Apply** job that waits for a reviewer's approval, plans again and refuses to apply unless the changes are exactly the approved ones | infra-terraform |
+| [`terraform-destroy.yaml`](.github/workflows/terraform-destroy.yaml) | typed confirmation, a **Plan** of everything that would be destroyed (+ reason), reviewer approval, then empties the cluster (Argo CD apps, PVCs, LoadBalancer Services), destroys exactly the approved resources, and lists leftovers (EBS volumes, classic load balancers) | infra-terraform |
 
 Every language workflow has the same job names (`Lint & Format`, `Secret Scan`, `Build Check`, `Unit Tests`,
 `SCA - Dependency Vulnerabilities`, `SAST - Static Security Analysis`), so branch protection looks the same everywhere. In a
@@ -102,3 +105,20 @@ required checks taken from a repo's last green PR, squash-only merges, secret sc
 | v2.0.0 | all actions to their newest settled release (Node 24), cosign 3, SBOM as attestation, Semgrep via pip (breaking: callers no longer pass `SEMGREP_APP_TOKEN`) |
 | v2.0.1 | classic cosign signature format (Docker Hub has no referrers API) |
 | v2.0.2 | secret scan runs the open-source **gitleaks CLI** (pinned, SHA-256 checked) instead of `gitleaks-action`, whose license is paid for organisation-owned repositories; the cosign self-verification accepts the workflows repo under both owners (`mladenovskistefan111`, `platform-boutique`) |
+| v2.1.0 | Terraform pipeline: `terraform-ci` (fmt, validate, TFLint, Trivy, Checkov, Infracost, plan comment), `terraform-apply`, `terraform-destroy` |
+
+## The Terraform workflows
+
+- **Credentials:** the callers pass `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` as secrets, or set `role_to_assume` to use GitHub OIDC
+  (no stored keys; the preferred end state). Pull requests from forks never get them.
+- **Approvals:** both split into a read-only **Plan** job and an **Apply**/**Destroy** job in a GitHub environment (`environment` input; put
+  required reviewers on it). The plan and the required `reason` are on the run page before the approval; after it, the job plans again and
+  stops unless the list of changes is identical to the approved one. A run with nothing to change asks for no approval. Destroy additionally
+  needs a typed confirmation. (The Plan job's only side effect: it admits the runner's address to the cluster API list.)
+- **Accepted risks** are written down next to the scanners' configuration in the calling repository (`.trivyignore.yaml`, `.checkov.yaml`,
+  each entry with its reason); a scan that fails is never silenced without one.
+- **The cluster API** admits only listed addresses. A GitHub-hosted runner has a new address on every run, so `terraform-apply` and
+  `terraform-destroy` add it to the variable named in `runner_ip_variable` and, if the cluster exists, to the endpoint before Terraform
+  refreshes the cluster's Helm and manifest resources. The pull-request plan does not refresh, so it needs no such access.
+- **Cost estimate:** Infracost shows on-demand prices and no usage-based items (NAT data, load balancer traffic, logs).
+

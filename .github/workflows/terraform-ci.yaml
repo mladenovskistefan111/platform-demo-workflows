@@ -1,0 +1,271 @@
+name: Terraform CI
+
+# Reusable pull-request pipeline for a Terraform repository. Jobs run in parallel and none of them changes anything in AWS:
+#   Format and validate  terraform fmt -check, terraform validate for every root module (no backend, locked providers)
+#   TFLint               lint rules of Terraform and of the AWS provider (config: .tflint.hcl in the calling repository)
+#   Trivy config scan    misconfigurations, HIGH and CRITICAL fail (accepted risks: .trivyignore.yaml with a written reason)
+#   Checkov              policy-as-code scan (config: .checkov.yaml in the calling repository; accepted risks inline: #checkov:skip=ID:reason)
+#   Cost estimate        Infracost monthly estimate as a pull request comment (only when the INFRACOST_API_KEY secret is given)
+#   Plan                 terraform plan against the real state, as a pull request comment (only with AWS access and a state bucket;
+#                        no refresh and no API access to the cluster, so it never touches the running platform)
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/terraform-ci.yaml@<sha> # <tag>
+
+on:
+  workflow_call:
+    inputs:
+      terraform_version:
+        description: Terraform version to install.
+        type: string
+        default: "1.16.6"
+      checkov_version:
+        description: Checkov version to install from PyPI.
+        type: string
+        default: "3.3.29"
+      directories:
+        description: Root modules to validate, space separated.
+        type: string
+        default: "envs/platform bootstrap"
+      plan_directory:
+        description: Root module to plan (empty = no plan).
+        type: string
+        default: ""
+      cost_directory:
+        description: Root module to price (empty = no cost estimate).
+        type: string
+        default: ""
+      state_bucket:
+        description: S3 bucket of the remote state (needed for the plan).
+        type: string
+        default: ""
+      aws_region:
+        type: string
+        default: us-east-1
+      role_to_assume:
+        description: IAM role to assume through GitHub OIDC (empty = use the AWS_* secrets).
+        type: string
+        default: ""
+      tf_vars:
+        description: JSON object of Terraform variables for the plan and the cost estimate (no secrets).
+        type: string
+        default: "{}"
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      INFRACOST_API_KEY:
+        required: false
+
+permissions: {}
+
+jobs:
+  validate:
+    name: Format and validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+      - name: Format
+        run: terraform fmt -recursive -check -diff
+      - name: Validate
+        env:
+          DIRECTORIES: ${{ inputs.directories }}
+        run: |
+          for dir in $DIRECTORIES; do
+            echo "::group::$dir"
+            terraform -chdir="$dir" init -backend=false -input=false -lockfile=readonly
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+
+  tflint:
+    name: TFLint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: v0.64.0
+      - name: Lint
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # rule sets are downloaded from GitHub releases: avoids the anonymous rate limit
+        run: |
+          tflint --init
+          tflint --recursive --format compact
+
+  trivy:
+    name: Trivy config scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          trivyignores: .trivyignore.yaml
+
+  checkov:
+    name: Checkov
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The CLI from PyPI, pinned: bridgecrewio/checkov-action runs a Docker image from 2022 (bridgecrew/checkov:2.0.930), whose checks
+      # disagree with current releases.
+      - name: Checkov
+        env:
+          CHECKOV_VERSION: ${{ inputs.checkov_version }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/checkov"
+          "$RUNNER_TEMP/checkov/bin/pip" install --quiet "checkov==$CHECKOV_VERSION"
+          "$RUNNER_TEMP/checkov/bin/checkov" --directory . --config-file .checkov.yaml --compact --quiet
+
+  cost:
+    name: Cost estimate
+    if: inputs.cost_directory != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      TF_VARS_JSON: ${{ inputs.tf_vars }}
+      COST_DIRECTORY: ${{ inputs.cost_directory }}
+      HAS_KEY: ${{ secrets.INFRACOST_API_KEY != '' }}
+    steps:
+      - name: Skipped without an Infracost API key
+        if: env.HAS_KEY != 'true'
+        run: |
+          echo "::notice::No INFRACOST_API_KEY secret: the cost estimate is skipped. A free key: https://www.infracost.io (sign up, then 'infracost auth login' or the dashboard)."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.HAS_KEY == 'true'
+        with:
+          persist-credentials: false
+      - uses: infracost/actions/setup@a5783eb98adc93aa7a0049fce0abb06fdd30770a # v5.0.1
+        if: env.HAS_KEY == 'true'
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+      - name: Estimate
+        if: env.HAS_KEY == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"${TF_VARS_JSON:-{}}" > tfvars.env
+          set -a; . ./tfvars.env; set +a
+          infracost breakdown --path "$COST_DIRECTORY" --format json --out-file infracost.json
+          {
+            echo '<!-- terraform-cost -->'
+            echo '### Monthly cost estimate (Infracost)'
+            echo
+            echo '```'
+            infracost output --path infracost.json --format table --show-skipped
+            echo '```'
+            echo 'On-demand prices: Spot capacity is cheaper than shown. Usage-based items (NAT data, load balancer traffic, logs) are not included.'
+          } > cost.md
+          cat cost.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$PR_NUMBER" ]; then
+            id="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate --jq '.[] | select(.body | startswith("<!-- terraform-cost -->")) | .id' | head -1)"
+            body="$(jq -Rs '{body: .}' < cost.md)"
+            if [ -n "$id" ]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" --input - <<<"$body" >/dev/null
+            else gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --input - <<<"$body" >/dev/null; fi
+          fi
+
+  plan:
+    name: Plan
+    # Pull requests from the same repository only: a fork must never get the AWS secrets.
+    if: inputs.plan_directory != '' && inputs.state_bucket != '' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    env:
+      TF_VARS_JSON: ${{ inputs.tf_vars }}
+      PLAN_DIRECTORY: ${{ inputs.plan_directory }}
+      STATE_BUCKET: ${{ inputs.state_bucket }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      HAS_AWS: ${{ inputs.role_to_assume != '' || secrets.AWS_ACCESS_KEY_ID != '' }}
+    steps:
+      - name: Skipped without AWS access
+        if: env.HAS_AWS != 'true'
+        run: |
+          echo "::notice::No AWS credentials (secrets or role): the plan is skipped."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.HAS_AWS == 'true'
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        if: env.HAS_AWS == 'true'
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ inputs.role_to_assume }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        if: env.HAS_AWS == 'true'
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+      - name: Is there a state bucket yet?
+        if: env.HAS_AWS == 'true'
+        run: |
+          if aws s3api head-bucket --bucket "$STATE_BUCKET" 2>/dev/null; then echo "HAS_STATE=true" >> "$GITHUB_ENV"
+          else echo "::notice::State bucket $STATE_BUCKET does not exist yet (run the bootstrap workflow): no plan."; fi
+      - name: Plan
+        if: env.HAS_AWS == 'true' && env.HAS_STATE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"${TF_VARS_JSON:-{}}" > tfvars.env
+          set -a; . ./tfvars.env; set +a
+          terraform -chdir="$PLAN_DIRECTORY" init -input=false -lockfile=readonly -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
+          # -refresh=false: the plan compares the code with the state and does not call the cluster API (which only the maintainer's
+          # address and the deploy runner may reach), so it never touches the running platform.
+          set +e
+          terraform -chdir="$PLAN_DIRECTORY" plan -input=false -no-color -refresh=false -lock-timeout=5m -out=tfplan > plan.log 2>&1
+          code=$?
+          set -e
+          terraform -chdir="$PLAN_DIRECTORY" show -no-color tfplan > plan.txt 2>/dev/null || cp plan.log plan.txt
+          {
+            echo '<!-- terraform-plan -->'
+            echo "### Terraform plan (\`$PLAN_DIRECTORY\`, no refresh)"
+            echo
+            echo '<details><summary>Show the plan</summary>'
+            echo
+            echo '```hcl'
+            head -c 60000 plan.txt
+            echo
+            echo '```'
+            echo '</details>'
+          } > plan.md
+          cat plan.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$PR_NUMBER" ]; then
+            id="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate --jq '.[] | select(.body | startswith("<!-- terraform-plan -->")) | .id' | head -1)"
+            body="$(jq -Rs '{body: .}' < plan.md)"
+            if [ -n "$id" ]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" --input - <<<"$body" >/dev/null
+            else gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --input - <<<"$body" >/dev/null; fi
+          fi
+          exit "$code"

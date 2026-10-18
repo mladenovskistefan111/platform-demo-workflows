@@ -1,0 +1,243 @@
+name: Terraform apply
+
+# Reusable deployment of a Terraform root module with a human gate:
+#   Plan   shows what would change and the reason given, on the run page; changes nothing (except admitting the runner to the API list)
+#   Apply  runs in a GitHub environment, so required reviewers must approve it first; it plans again and refuses to apply unless the
+#          changes are exactly the ones that were shown. If there is nothing to change, there is nothing to approve.
+# Run it from one concurrency group per repository (the state lock would refuse a second run anyway).
+#
+# GitHub-hosted runners have a different public address every time, and the cluster's API endpoint only admits listed addresses.
+# So the runner's address is added to the variable named in runner_ip_variable, and, when the cluster already exists, to the
+# endpoint itself before Terraform needs it (otherwise refreshing the cluster's Helm and manifest resources would time out).
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/terraform-apply.yaml@<sha> # <tag>
+
+on:
+  workflow_call:
+    inputs:
+      terraform_version:
+        type: string
+        default: "1.16.6"
+      working_directory:
+        description: Root module to apply.
+        type: string
+        default: envs/platform
+      state_bucket:
+        description: S3 bucket of the remote state.
+        type: string
+        required: true
+      aws_region:
+        type: string
+        default: us-east-1
+      role_to_assume:
+        description: IAM role to assume through GitHub OIDC (empty = use the AWS_* secrets).
+        type: string
+        default: ""
+      tf_vars:
+        description: JSON object of Terraform variables (no secrets).
+        type: string
+        default: "{}"
+      runner_ip_variable:
+        description: Name of the list(string) variable the runner's address (/32) is appended to (empty = none).
+        type: string
+        default: ""
+      cluster_name:
+        description: EKS cluster name, to admit the runner to an existing cluster's API endpoint (empty = none).
+        type: string
+        default: ""
+      reason:
+        description: Why this deployment is being made; shown with the plan, where it is approved.
+        type: string
+        required: true
+      environment:
+        description: GitHub environment of the Apply job (approvals are configured there).
+        type: string
+        default: production
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+
+permissions: {}
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+      changes: ${{ steps.plan.outputs.changes }}
+    env:
+      WORKING_DIRECTORY: ${{ inputs.working_directory }}
+      STATE_BUCKET: ${{ inputs.state_bucket }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      TF_VARS_JSON: ${{ inputs.tf_vars }}
+      RUNNER_IP_VARIABLE: ${{ inputs.runner_ip_variable }}
+      CLUSTER_NAME: ${{ inputs.cluster_name }}
+      REASON: ${{ inputs.reason }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ inputs.role_to_assume }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Variables and this runner's address
+        run: |
+          set -euo pipefail
+          ip="$(curl -fsS --retry 3 https://checkip.amazonaws.com | tr -d '[:space:]')"
+          echo "RUNNER_IP=$ip" >> "$GITHUB_ENV"
+          vars="${TF_VARS_JSON:-}"; [ -n "$vars" ] || vars='{}'
+          if [ -n "$RUNNER_IP_VARIABLE" ]; then
+            vars="$(jq -c --arg k "$RUNNER_IP_VARIABLE" --arg ip "$ip/32" '.[$k] = (((.[$k] // []) + [$ip]) | unique)' <<<"$vars")"
+          fi
+          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"$vars" >> "$GITHUB_ENV"
+
+      - name: Admit this runner to the cluster API (if the cluster exists)
+        run: |
+          set -euo pipefail
+          [ -n "$CLUSTER_NAME" ] || exit 0
+          if ! cur="$(aws eks describe-cluster --name "$CLUSTER_NAME" --query 'cluster.resourcesVpcConfig.publicAccessCidrs' --output json 2>/dev/null)"; then
+            echo "No cluster $CLUSTER_NAME yet."; exit 0
+          fi
+          if jq -e --arg ip "$RUNNER_IP/32" 'index($ip)' <<<"$cur" >/dev/null; then exit 0; fi
+          new="$(jq -r --arg ip "$RUNNER_IP/32" '. + [$ip] | join(",")' <<<"$cur")"
+          aws eks update-cluster-config --name "$CLUSTER_NAME" --resources-vpc-config "endpointPublicAccess=true,publicAccessCidrs=$new" > /dev/null
+          aws eks wait cluster-active --name "$CLUSTER_NAME"
+
+      - name: Init
+        run: terraform -chdir="$WORKING_DIRECTORY" init -input=false -lockfile=readonly -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
+
+      - name: Plan
+        id: plan
+        run: |
+          set -euo pipefail
+          set +e
+          terraform -chdir="$WORKING_DIRECTORY" plan -input=false -no-color -lock-timeout=10m -detailed-exitcode -out=tfplan > plan.txt 2>&1
+          code=$?
+          set -e
+          if [ "$code" -eq 1 ]; then cat plan.txt; exit 1; fi
+          terraform -chdir="$WORKING_DIRECTORY" show -json tfplan \
+            | jq -r '[.resource_changes[]? | select(.change.actions != ["no-op"]) | "\(.address) \(.change.actions | join(","))"] | sort | .[]' > changes.txt
+          if [ "$code" -eq 2 ]; then echo "has_changes=true" >> "$GITHUB_OUTPUT"; else echo "has_changes=false" >> "$GITHUB_OUTPUT"; fi
+          { echo "changes<<END_OF_CHANGES"; cat changes.txt; echo "END_OF_CHANGES"; } >> "$GITHUB_OUTPUT"
+          line="$(grep -E '^(Plan:|No changes)' plan.txt | head -1 || true)"
+          {
+            echo "## Plan: what this deployment would change"
+            echo
+            echo "**Reason given:** $REASON"
+            echo
+            echo "**Result:** ${line:-see the plan below}"
+            echo
+            echo "Nothing has been changed yet. The next job waits for an approval: read this plan and the reason first."
+            echo
+            echo '```'
+            cat changes.txt
+            echo '```'
+            echo
+            echo "<details><summary>Full plan</summary>"
+            echo
+            echo '```hcl'
+            head -c 800000 plan.txt
+            echo
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: Apply
+    needs: plan
+    if: needs.plan.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      WORKING_DIRECTORY: ${{ inputs.working_directory }}
+      STATE_BUCKET: ${{ inputs.state_bucket }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      TF_VARS_JSON: ${{ inputs.tf_vars }}
+      RUNNER_IP_VARIABLE: ${{ inputs.runner_ip_variable }}
+      CLUSTER_NAME: ${{ inputs.cluster_name }}
+      REASON: ${{ inputs.reason }}
+      APPROVED: ${{ needs.plan.outputs.changes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ inputs.role_to_assume }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Variables and this runner's address
+        run: |
+          set -euo pipefail
+          ip="$(curl -fsS --retry 3 https://checkip.amazonaws.com | tr -d '[:space:]')"
+          echo "RUNNER_IP=$ip" >> "$GITHUB_ENV"
+          vars="${TF_VARS_JSON:-}"; [ -n "$vars" ] || vars='{}'
+          if [ -n "$RUNNER_IP_VARIABLE" ]; then
+            vars="$(jq -c --arg k "$RUNNER_IP_VARIABLE" --arg ip "$ip/32" '.[$k] = (((.[$k] // []) + [$ip]) | unique)' <<<"$vars")"
+          fi
+          jq -r 'to_entries[] | "TF_VAR_\(.key)=\(if (.value|type)=="string" then .value else (.value|tojson) end)"' <<<"$vars" >> "$GITHUB_ENV"
+
+      - name: Admit this runner to the cluster API (if the cluster exists)
+        run: |
+          set -euo pipefail
+          [ -n "$CLUSTER_NAME" ] || exit 0
+          if ! cur="$(aws eks describe-cluster --name "$CLUSTER_NAME" --query 'cluster.resourcesVpcConfig.publicAccessCidrs' --output json 2>/dev/null)"; then
+            echo "No cluster $CLUSTER_NAME yet."; exit 0
+          fi
+          if jq -e --arg ip "$RUNNER_IP/32" 'index($ip)' <<<"$cur" >/dev/null; then exit 0; fi
+          new="$(jq -r --arg ip "$RUNNER_IP/32" '. + [$ip] | join(",")' <<<"$cur")"
+          aws eks update-cluster-config --name "$CLUSTER_NAME" --resources-vpc-config "endpointPublicAccess=true,publicAccessCidrs=$new" > /dev/null
+          aws eks wait cluster-active --name "$CLUSTER_NAME"
+
+      - name: Init
+        run: terraform -chdir="$WORKING_DIRECTORY" init -input=false -lockfile=readonly -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
+
+      - name: Plan again and compare with what was approved
+        run: |
+          set -euo pipefail
+          terraform -chdir="$WORKING_DIRECTORY" plan -input=false -no-color -lock-timeout=10m -out=tfplan > plan.txt 2>&1 || { cat plan.txt; exit 1; }
+          terraform -chdir="$WORKING_DIRECTORY" show -json tfplan \
+            | jq -r '[.resource_changes[]? | select(.change.actions != ["no-op"]) | "\(.address) \(.change.actions | join(","))"] | sort | .[]' > changes.txt
+          printf '%s\n' "$APPROVED" | sort > approved.txt
+          if ! diff -u approved.txt changes.txt; then
+            echo "::error::The changes are no longer the ones that were approved (see the diff above). Nothing was applied. Run the workflow again to review the new plan."
+            exit 1
+          fi
+          echo "The plan is the approved one: $(wc -l < changes.txt) resource changes."
+
+      - name: Apply
+        run: terraform -chdir="$WORKING_DIRECTORY" apply -input=false -no-color -lock-timeout=10m tfplan
+
+      - name: Outputs
+        run: |
+          {
+            echo '### Deployed'
+            echo
+            echo "Reason: $REASON"
+            echo
+            echo '```'
+            terraform -chdir="$WORKING_DIRECTORY" output -no-color
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
