@@ -4,7 +4,7 @@ name: Terraform CI
 #   Format and validate  terraform fmt -check, terraform validate for every root module (no backend, locked providers)
 #   TFLint               lint rules of Terraform and of the AWS provider (config: .tflint.hcl in the calling repository)
 #   Trivy config scan    misconfigurations, HIGH and CRITICAL fail (accepted risks: .trivyignore.yaml with a written reason)
-#   Checkov              policy-as-code scan (config: .checkov.yaml in the calling repository)
+#   Checkov              policy-as-code scan (config: .checkov.yaml in the calling repository; accepted risks inline: #checkov:skip=ID:reason)
 #   Cost estimate        Infracost monthly estimate as a pull request comment (only when the INFRACOST_API_KEY secret is given)
 #   Plan                 terraform plan against the real state, as a pull request comment (only with AWS access and a state bucket;
 #                        no refresh and no API access to the cluster, so it never touches the running platform)
@@ -17,6 +17,10 @@ on:
         description: Terraform version to install.
         type: string
         default: "1.16.6"
+      checkov_version:
+        description: Checkov version to install from PyPI.
+        type: string
+        default: "3.3.29"
       directories:
         description: Root modules to validate, space separated.
         type: string
@@ -126,12 +130,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0
-        with:
-          directory: .
-          framework: terraform
-          quiet: true
-          soft_fail: false
+      # The CLI from PyPI, pinned: bridgecrewio/checkov-action runs a Docker image from 2022 (bridgecrew/checkov:2.0.930), whose checks
+      # disagree with current releases.
+      - name: Checkov
+        env:
+          CHECKOV_VERSION: ${{ inputs.checkov_version }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/checkov"
+          "$RUNNER_TEMP/checkov/bin/pip" install --quiet "checkov==$CHECKOV_VERSION"
+          "$RUNNER_TEMP/checkov/bin/checkov" --directory . --config-file .checkov.yaml --compact --quiet
 
   cost:
     name: Cost estimate
