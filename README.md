@@ -16,7 +16,7 @@ copy of a 300-line pipeline, so a fix or a version bump lands once. Current rele
 | [`workflow-lint.yaml`](.github/workflows/workflow-lint.yaml) | actionlint (+ shellcheck on CI runners) and "every `uses:` is pinned to a full commit SHA" | every repo (this one included) |
 | [`terraform-ci.yaml`](.github/workflows/terraform-ci.yaml) | `fmt` + `validate`, TFLint, Trivy config scan, Checkov, Infracost monthly estimate (needs a free `INFRACOST_API_KEY`), `terraform plan` as a PR comment (no refresh, never touches the running platform) | infra-terraform |
 | [`terraform-plan.yaml`](.github/workflows/terraform-plan.yaml) | plans a root module (or its destruction), saves the plan encrypted in the state bucket (7 days), shows the reason and the changes on the run page; changes nothing | infra-terraform |
-| [`terraform-apply.yaml`](.github/workflows/terraform-apply.yaml) | **Review** job (checks the saved plan belongs to this commit, is recent and unaltered; shows reason and plan), then an **Apply** job in a GitHub environment that waits for a reviewer and applies exactly the reviewed plan. Also runs destroy plans, with optional before/after scripts | infra-terraform |
+| [`terraform-apply.yaml`](.github/workflows/terraform-apply.yaml) | **Review** job (checks the saved plan belongs to this commit, is recent and unaltered; shows reason, an "at a glance" summary computed by script with anything destroyed or replaced first, and the plan), then an **Apply** job in a GitHub environment that waits for a reviewer and applies exactly the reviewed plan. Also runs destroy plans, with optional before/after scripts | infra-terraform |
 
 Every language workflow has the same job names (`Lint & Format`, `Secret Scan`, `Build Check`, `Unit Tests`,
 `SCA - Dependency Vulnerabilities`, `SAST - Static Security Analysis`), so branch protection looks the same everywhere. In a
@@ -117,6 +117,10 @@ required checks taken from a repo's last green PR, squash-only merges, secret sc
   Its Review job refuses a plan that is for another directory, another commit, older than `max_plan_age_hours`, of the wrong kind
   (`destroy` must match), or whose checksum differs; it shows the reason and the plan on the run page. The Apply job waits for the
   environment's reviewers, re-checks the checksum, applies, and deletes the plan. Terraform itself rejects a plan whose state changed.
+- **AI explanation (optional):** with an `ANTHROPIC_API_KEY` secret passed by the caller, an advisory job asks a small Claude model
+  (`ai_model`, default `claude-haiku-5-5`, effort low) to explain the at-a-glance summary in plain words. It sees names and counts only,
+  never attribute values; the reason text and the summary are marked as data, not instructions. The apply job does not wait for it and its
+  failure changes nothing; without the secret it is skipped, like the Infracost job. Approve from the list of changes, not from the AI text.
 - **Destroy** is a plan with `destroy: true` applied with `destroy: true`; `pre_apply_script` and `post_apply_script` (paths in the calling
   repository) empty the cluster before and list leftovers after. A deployment can never apply a destroy plan, nor the reverse.
 - **Accepted risks** are written down next to the scanners' configuration in the calling repository (`.trivyignore.yaml`, `.checkov.yaml`,
