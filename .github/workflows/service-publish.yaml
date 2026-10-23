@@ -149,6 +149,7 @@ jobs:
     needs: [promote]
     if: ${{ inputs.prune }}
     permissions:
+      contents: read
       packages: write
     uses: platform-boutique/platform-demo-workflows/.github/workflows/ghcr-prune.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
     with:

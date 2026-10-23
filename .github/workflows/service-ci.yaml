@@ -18,7 +18,8 @@ name: Service CI
 # uses: is a full commit SHA" fails for as long as a placeholder is left.
 #
 # Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/service-ci.yaml@<sha> # <tag>
-# The calling job must grant: contents: read, packages: read (and checks: write for dotnet).
+# The calling job must grant: contents: read, packages: read and checks: write (GitHub checks the nested jobs' permissions
+# statically, also for the languages a repository does not use).
 
 on:
   workflow_call:

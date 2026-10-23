@@ -42,11 +42,11 @@ if CFG["lang"] == "none":
 if CFG["trivy"]:
     ci_inputs["trivyignores"] = CFG["trivy"]
 
-ci_perms = "      contents: read\n      packages: read # reads the registry build cache\n"
-if CFG["lang"] == "dotnet":
-    ci_perms += "      checks: write # test-reporter publishes a check run\n"
-if CFG["lang"] == "none":
-    ci_perms = "      contents: read\n"
+# GitHub checks the permissions of EVERY job of the called workflows against the caller's grant, also jobs that are skipped
+# (the dotnet job of service-ci asks for checks: write even in a Go repository): one grant for all languages.
+ci_perms = ("      contents: read\n"
+            "      packages: read # reads the registry build cache\n"
+            "      checks: write # only the dotnet test reporter uses it; the grant is checked for every job, skipped ones too\n")
 
 CI = f"""name: CI
 

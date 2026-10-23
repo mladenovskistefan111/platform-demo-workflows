@@ -31,3 +31,7 @@ jobs:
 
       - name: Check
         run: python3 tools/check-consistency.py
+
+      # a nested job asking for more than its caller grants is a silent startup_failure
+      - name: Check nested permissions
+        run: python3 tools/check-permissions.py
