@@ -13,8 +13,8 @@ jobs:
       contents: read
     uses: ./.github/workflows/workflow-lint.yaml
 
-  # The generated workflows are what the generator writes, every job has permissions and a timeout, and service-ci passes its
-  # inputs to the language workflows with the same defaults (tools/check-consistency.py).
+  # The generated workflows are what the generators write, every job has permissions and a timeout, the flat service-ci-<language>
+  # workflows match the stand-alone ones (inputs, guards, pins) and their gate waits for every job (tools/check-consistency.py).
   consistency:
     name: Generated files and conventions
     runs-on: ubuntu-latest
@@ -35,3 +35,7 @@ jobs:
       # a nested job asking for more than its caller grants is a silent startup_failure
       - name: Check nested permissions
         run: python3 tools/check-permissions.py
+
+      # the gate script of every service-ci-<language> file, run against success/skip/failure/cancel scenarios
+      - name: Gate scenarios
+        run: python3 tools/test-gate.py

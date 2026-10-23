@@ -1,22 +1,22 @@
 # platform-demo-workflows
 
 Reusable GitHub Actions workflows shared by the platform-demo repositories. Services call these instead of carrying their own
-copy of a 300-line pipeline, so a fix or a version bump lands once. Current release: **v3.2.1** (history below). Callers pin the release they use by commit SHA: the developer portal calls v3.0.3 and the service repositories still pin v2.0.2 until they move to `service-ci`/`service-publish`.
+copy of a 300-line pipeline, so a fix or a version bump lands once. Current release: **v3.3.0** (history below). Callers pin the release they use by commit SHA: the developer portal calls v3.0.3; the service repositories call `service-ci-<language>`/`service-publish` (v3.3.0, the pilot still pins v3.2.1) or, until they move, v2.0.2.
 
 | Workflow | Purpose | Used by |
 |---|---|---|
-| [`go-ci.yaml`](.github/workflows/go-ci.yaml) | lint/format, secret scan, build, unit tests, optional E2E and gRPC smoke test, then SCA (govulncheck) and SAST (gosec) | checkout, shipping, product-catalog, frontend |
+| [`go-ci.yaml`](.github/workflows/go-ci.yaml) | stand-alone, for repositories not on the service pipeline (older pins, portal): lint/format, secret scan, build, unit tests, optional E2E and gRPC smoke test, then SCA (govulncheck) and SAST (gosec) | checkout, shipping, product-catalog, frontend |
 | [`node-ci.yaml`](.github/workflows/node-ci.yaml) | format/typecheck/lint, secret scan, build, tests, `npm audit`, Semgrep, optional gRPC smoke test | currency, payment |
 | [`python-ci.yaml`](.github/workflows/python-ci.yaml) | ruff, secret scan, entry-point parse check, pytest, pip-audit, bandit | email, recommendation |
 | [`java-gradle-ci.yaml`](.github/workflows/java-gradle-ci.yaml) | compile, secret scan, build, tests, Trivy fs scan, Semgrep | ad |
 | [`dotnet-ci.yaml`](.github/workflows/dotnet-ci.yaml) | `dotnet format` + analyzers, secret scan, build, tests, vulnerable-package audit, Semgrep | cart |
 | [`docker-build.yaml`](.github/workflows/docker-build.yaml) | build once, stage on ghcr.io, Trivy-scan that exact digest (HIGH/CRITICAL fail) | every service |
 | [`docker-promote.yaml`](.github/workflows/docker-promote.yaml) | copy the scanned digest to Docker Hub (no rebuild), tag, cosign-sign, self-verify, attach the SBOM as a signed `spdxjson` attestation, self-verify; refuses commits not on `main` | every service |
-| [`secret-scan.yaml`](.github/workflows/secret-scan.yaml) | stand-alone gitleaks scan (the pull request's commits; full history on manual runs) | helm, observability, product-catalog-db |
-| [`workflow-lint.yaml`](.github/workflows/workflow-lint.yaml) | actionlint (+ shellcheck on CI runners) and "every `uses:` is pinned to a full commit SHA" | every repo (this one included) |
-| [`service-ci.yaml`](.github/workflows/service-ci.yaml) | the pull-request pipeline of an app repository: secret scan, workflow lint, the language workflow and an unpushed image build + scan in parallel, docs-only filter, one `gate` job | every app repository |
+| [`secret-scan.yaml`](.github/workflows/secret-scan.yaml) | stand-alone gitleaks scan (the pull request's commits; full history on manual runs); also the source of the `Guard: Secrets` job of the service pipeline | helm, observability |
+| [`workflow-lint.yaml`](.github/workflows/workflow-lint.yaml) | stand-alone actionlint (+ shellcheck on CI runners) and "every `uses:` is pinned to a full commit SHA"; also the source of `Guard: Workflows` | repositories not on the service pipeline (this one included) |
+| [`service-ci-go.yaml`](.github/workflows/service-ci-go.yaml), [`-node`](.github/workflows/service-ci-node.yaml), [`-python`](.github/workflows/service-ci-python.yaml), [`-java`](.github/workflows/service-ci-java.yaml), [`-dotnet`](.github/workflows/service-ci-dotnet.yaml), [`-none`](.github/workflows/service-ci-none.yaml) | **generated** (tools/gen-service-ci.py), flat pull-request pipeline of an app repository, one file per language, only that language's jobs: guards (change detection, secrets, workflows), lint, build (+ optional smoke test), tests (+ optional E2E), SCA, SAST, unpushed image build + Trivy scan, one `gate`. `none` = guards + image scan + gate (developer portal; product-catalog-db with `image: false`) | every app repository |
 | [`service-publish.yaml`](.github/workflows/service-publish.yaml) | merge to `main`: build once, scan the digest, publish `sha-<7>` to Docker Hub, sign, SBOM, dev promotion PR, prune staging images | every app repository |
-| [`changed-paths.yaml`](.github/workflows/changed-paths.yaml) | tells whether a change touches code or only docs/metadata (plain git, no token) | service-ci, service-publish |
+| [`changed-paths.yaml`](.github/workflows/changed-paths.yaml) | tells whether a change touches code or only docs/metadata (plain git, no token); `service-ci-*` carry an identical inline copy (`Guard: Changes`) | service-publish |
 | [`gitops-promote.yaml`](.github/workflows/gitops-promote.yaml) | changes only `image.tag` and `image.digest` of one app in one environment of platform-demo-helm through a pull request (GitHub App token scoped to the helm repo, branch `promote/<app>/<env>` force-updated so a newer build replaces an older open one, squash auto-merge); idempotent | app publish workflows (dev), helm `Promote` (stage, prod) |
 | [`gitops-rollback.yaml`](.github/workflows/gitops-rollback.yaml) | moves an app back or forward to a digest that was deployed before (`previous`, `latest`, a digest or a helm commit) through a pull request (`rollback/<app>/<env>`, label `rollback`) that passes the same gates | helm `Rollback` |
 | [`scheduled-image-scan.yaml`](.github/workflows/scheduled-image-scan.yaml) | weekly Trivy scan of every deployed image digest (Monday 08:00 UTC); SARIF to the Security tab and one updated issue "Scheduled image scan" | helm `Scheduled scans` |
@@ -26,9 +26,11 @@ copy of a 300-line pipeline, so a fix or a version bump lands once. Current rele
 | [`terraform-plan.yaml`](.github/workflows/terraform-plan.yaml) | plans a root module (or its destruction), saves the plan encrypted in the state bucket (7 days), shows the reason and the changes on the run page; changes nothing | infra-terraform |
 | [`terraform-apply.yaml`](.github/workflows/terraform-apply.yaml) | **Review** job (checks the saved plan belongs to this commit, is recent and unaltered; shows reason, an "at a glance" summary computed by script with anything destroyed or replaced first, and the plan), then an **Apply** job in a GitHub environment that waits for a reviewer and applies exactly the reviewed plan. Also runs destroy plans, with optional before/after scripts | infra-terraform |
 
-Every language workflow has the same job names (`Lint & Format`, `Secret Scan`, `Build Check`, `Unit Tests`,
-`SCA - Dependency Vulnerabilities`, `SAST - Static Security Analysis`), so branch protection looks the same everywhere. In a
-caller the check names are `<caller job id> / <job name>`, e.g. `go / Lint & Format`, `image / Scan Image for CVEs`.
+The **stand-alone** `go-ci`, `node-ci`, `python-ci`, `java-gradle-ci`, `dotnet-ci`, `secret-scan` and `workflow-lint` are for repositories
+that are not on the service pipeline (callers pinned to an older release, the developer portal). App repositories use `service-ci-<language>`.
+All six `service-ci-*` files have the same job names (`Guard: Changes`, `Guard: Secrets`, `Guard: Workflows`, `Check: Lint`, `Check: Build`,
+`Check: Tests`, `Security: SCA`, `Security: SAST`, `Image: Build + CVE scan`, `gate`), so branch protection looks the same everywhere. In a
+caller the check names are `<caller job id> / <job name>`, e.g. `ci / Check: Build`; the required one is `ci / gate`.
 
 ## How a service calls them
 
@@ -40,17 +42,27 @@ Two small files per app repository (generated by `tools/gen-callers.py`): `ci.ya
 on: { pull_request: { branches: [main] }, workflow_dispatch: }
 permissions: {}
 jobs:
-  ci: { permissions: { contents: read, packages: read, checks: write }, uses: .../service-ci.yaml@<sha> # v3.2.0, with: { language: go, ... } }
+  ci: { permissions: { contents: read, packages: read }, uses: .../service-ci-go.yaml@<sha> # v3.3.0, with: { test-packages: ..., ... } }
+  # service-ci-<go|node|python|java|dotnet|none>.yaml; only dotnet also needs checks: write (test reporter); product-catalog-db: -none with image: false
 # .github/workflows/publish.yaml (shape)
 on: { push: { branches: [main] }, workflow_dispatch: }
 jobs:
-  publish: { permissions: { contents: read, packages: write, id-token: write }, uses: .../service-publish.yaml@<sha> # v3.2.0,
+  publish: { permissions: { contents: read, packages: write, id-token: write }, uses: .../service-publish.yaml@<sha> # v3.3.0,
              with: { app: checkout-service }, secrets: DOCKERHUB_USERNAME / DOCKERHUB_TOKEN / PROMOTE_APP_ID / PROMOTE_APP_PRIVATE_KEY }
 ```
 
-**`service-ci`** (pull request): in parallel, a secret scan, workflow lint, the language workflow (lint, build, unit tests, SAST, SCA,
-optional E2E and smoke test) and an image build + Trivy scan that is never pushed. A docs-only change (`changed-paths.yaml`) skips the
-heavy jobs. It ends in one `gate` job: **`ci / gate` is the only required check**.
+**`service-ci-<language>`** (pull request): flat, one file per language, so the Actions graph shows only what the repository runs. Left to
+right: the guards `Guard: Changes`, `Guard: Secrets`, `Guard: Workflows`; next to them `Check: Lint`, `Check: Build`, `Check: Tests`,
+`Security: SCA`, `Security: SAST` and `Image: Build + CVE scan` (built into the local daemon, never pushed); at the end one `gate` job.
+**The left column means "starts at t=0", not "must pass first"**: all nine jobs start together, the checks wait only for the change
+detection (a docs-only change skips them), so a flaky gitleaks download or one lint complaint does not hide the test, SAST and Trivy
+results. `gate` needs every job, always runs, lists the failed or cancelled jobs first (their consequent skips are not noise) and is strict
+about the rest: **`ci / gate` is the only required check**. The optional smoke test (Go, Node: input `smoke-port`) is a step of
+`Check: Build`, reusing the build; the optional E2E tests (Go: `e2e-packages`) a step of `Check: Tests`; there are no optional jobs that
+would show up as skipped.
+The files are generated from the stand-alone workflows by `tools/gen-service-ci.py` (job bodies extracted, not retyped) and
+`tools/check-consistency.py` fails when they drift. Nothing is nested, so GitHub validates only the file's own jobs: the caller grants
+`contents: read` and `packages: read` (and `checks: write` for dotnet alone), and there is no placeholder pin or two-step release.
 
 **`service-publish`** (merge to `main`): build once, stage on ghcr.io, scan that exact digest, copy it to Docker Hub as `sha-<7>`, sign it
 (keyless cosign), attach the SBOM, open the promotion PR for `dev` through `gitops-promote.yaml`, and prune old staging images.
@@ -86,7 +98,7 @@ To take a major upgrade deliberately: raise it by hand (or temporarily remove th
 
 ## Changing a workflow (the procedure that worked)
 
-1. Branch, edit (`tools/gen-lang-workflows.py` generates the node/python/java/dotnet files - edit the generator, then run it),
+1. Branch, edit (`tools/gen-lang-workflows.py` generates the node/python/java/dotnet files, `tools/gen-service-ci.py` the `service-ci-*` files from them - edit the source or the generator, run both, in that order),
    run `actionlint` **with shellcheck installed** (CI has it; without it you miss real findings).
 2. Open a PR here (its CI is `workflow-lint`). To prove the change, open **throw-away PRs** in one repo per language whose
    `ci.yaml` pins the branch's commit SHA (`tools/gen-callers.py <repo-dir> <service> <sha> "test"`), wait for green, close them.
@@ -98,7 +110,7 @@ To take a major upgrade deliberately: raise it by hand (or temporarily remove th
 4. Breaking input/secret changes get a major version.
 
 Tools (all need the GitHub CLI logged in): `tools/bump-actions.py` (move every pin to the newest release older than N days,
-`--hold gradle/actions=v5`), `tools/gen-lang-workflows.py`, `tools/gen-callers.py`, `tools/gen-guardrails.py` (CODEOWNERS,
+`--hold gradle/actions=v5`), `tools/gen-lang-workflows.py`, `tools/gen-service-ci.py`, `tools/test-gate.py` (gate scenarios), `tools/check-consistency.py`, `tools/check-permissions.py`, `tools/gen-callers.py`, `tools/gen-guardrails.py` (CODEOWNERS,
 Dependabot, `.pre-commit-config.yaml` for a repo), `tools/transfer-repo.sh` (move a repo to the org and re-apply what a transfer resets), `tools/required-checks.sh` + `tools/protect-repo.sh` (branch protection with the
 required checks taken from a repo's last green PR, squash-only merges, secret scanning, tag ruleset).
 
@@ -134,6 +146,7 @@ required checks taken from a repo's last green PR, squash-only merges, secret sc
 | v3.1.0 | every job has a `timeout-minutes`; the language workflows run all their jobs in parallel; one generated secret-scan implementation (shallow, scans the pull request's commits); `changed-paths.yaml` (docs-only change filter); registry build cache on ghcr.io instead of `type=gha`; `docker-promote` gets `sha-only`, outputs and retries on the cosign lookups; new `gitops-promote`, `gitops-rollback`, `scheduled-image-scan`, `scheduled-code-scan`, `ghcr-prune` and `tools/check-repo-settings.sh` (read-only settings drift check) |
 | v3.2.0 | `service-ci` and `service-publish`: one pipeline for every app repository (pull request = verify, merge to `main` = publish once and open the dev promotion PR; no tags, no `release.yaml`); callers are two generated files (`ci.yaml`, `publish.yaml`); `ci / gate` is the single required check |
 | v3.2.1 | fix: `service-ci` / `service-publish` failed at startup (`startup_failure`) because GitHub checks the permissions of every nested job, skipped ones too: generated `ci.yaml` callers now grant `checks: write` (the dotnet job), the prune job of `service-publish` gets `contents: read`; new `tools/check-permissions.py` (run in this repository's CI) walks the nested workflows against the callers' grants |
+| v3.3.0 | `service-ci.yaml` is replaced by flat, generated, per-language pull-request workflows `service-ci-go`, `-node`, `-python`, `-java`, `-dotnet` and `-none` (tools/gen-service-ci.py). The Actions graph of a caller showed every language behind `if:` as hollow skipped boxes (and a duplicate Secret Scan, skipped E2E/smoke jobs, truncated names); now every file contains only the jobs its language runs, with no nested workflow, short names (`ci / Check: Build`) and the same shape everywhere: `Guard: Changes`, `Guard: Secrets`, `Guard: Workflows` start at t=0, the checks (`Check: Lint/Build/Tests`, `Security: SCA/SAST`, `Image: Build + CVE scan`) need only the change detection, `gate` waits for all and names the failed job first. The optional smoke test (Go, Node) is a step of `Check: Build` and the E2E tests (Go) a step of `Check: Tests` (no skipped jobs, one build). Because nothing is nested, a caller needs only `contents: read` + `packages: read` (`checks: write` for dotnet only) and there is no placeholder pin / two-step release (`tools/pin-service-workflows.sh` is gone). Callers: new `uses:` file name, no `language:` input, same `with:` otherwise; the required check stays `ci / gate`. `service-ci.yaml` is removed (v3.2.1 stays valid for callers pinned to it) |
 
 ## The Terraform workflows
 

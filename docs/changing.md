@@ -1,6 +1,6 @@
 # Changing a workflow
 
-1. Branch, edit (`tools/gen-lang-workflows.py` generates the node/python/java/dotnet files - edit the generator, then run it),
+1. Branch, edit (`tools/gen-lang-workflows.py` generates the node/python/java/dotnet files, `tools/gen-service-ci.py` the `service-ci-*` files from them - edit the source or the generator, run both, in that order; `tools/test-gate.py` runs the gate scenarios),
    run `actionlint` **with shellcheck installed** (CI has it; without it you miss real findings).
 2. Open a PR here (its CI is `workflow-lint`). To prove the change, open **throw-away PRs** in one repo per language whose
    `ci.yaml` pins the branch's commit SHA (`tools/gen-callers.py <repo-dir> <service> <sha> "test"`), wait for green, close them.

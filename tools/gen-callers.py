@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the two caller files of an app repository: .github/workflows/ci.yaml (pull requests -> service-ci.yaml, check `ci / gate`)
+"""Write the two caller files of an app repository: .github/workflows/ci.yaml (pull requests -> service-ci-<language>.yaml, check `ci / gate`)
 and publish.yaml (push to main -> service-publish.yaml). Removes the old ci-*.yaml / release.yaml.
 usage: gen-callers.py <repo-dir> <service> <wf-sha> <wf-ver>
 <service> is the app name = repository name without the `app-` prefix = helm chart name = Docker Hub repository."""
@@ -26,7 +26,7 @@ CFG = {
 }[svc]
 
 
-# inputs of service-ci (see its `on.workflow_call.inputs`); the keys in CFG["with_"] are passed through unchanged
+# inputs of service-ci-<language> (see its `on.workflow_call.inputs`); the keys in CFG["with_"] are passed through unchanged
 def with_block(d, indent="      "):
     out = "    with:\n"
     for k, v in d.items():
@@ -36,22 +36,24 @@ def with_block(d, indent="      "):
             out += f"{indent}{k}: {v}\n"
     return out
 
-ci_inputs = {"language": CFG["lang"], **CFG["with_"]}
+ci_inputs = dict(CFG["with_"])
 if CFG["lang"] == "none":
     ci_inputs["image"] = "false"  # no image pipeline for this repository
 if CFG["trivy"]:
     ci_inputs["trivyignores"] = CFG["trivy"]
 
-# GitHub checks the permissions of EVERY job of the called workflows against the caller's grant, also jobs that are skipped
-# (the dotnet job of service-ci asks for checks: write even in a Go repository): one grant for all languages.
+# The service-ci-<language> workflows are flat (no nested workflow), so GitHub validates only their own jobs: every caller grants
+# contents + packages (the image job reads the registry build cache); only the dotnet file has a job (the test reporter) that
+# needs checks: write.
 ci_perms = ("      contents: read\n"
-            "      packages: read # reads the registry build cache\n"
-            "      checks: write # only the dotnet test reporter uses it; the grant is checked for every job, skipped ones too\n")
+            "      packages: read # reads the registry build cache\n")
+if CFG["lang"] == "dotnet":
+    ci_perms += "      checks: write # the test reporter publishes a check run\n"
 
 CI = f"""name: CI
 
-# Pull-request gate: secret scan, workflow lint and (when code changed) tests, SAST, SCA and an image build + CVE scan, all in
-# parallel; nothing is pushed. The only required status check is `ci / gate`.
+# Pull-request gate: guards (change detection, secrets, workflows) start at t=0; when code changed, lint, build, tests, SCA, SAST
+# and an image build + CVE scan run in parallel with them; nothing is pushed. The only required status check is `ci / gate`.
 on:
   pull_request:
     branches: [main]
@@ -66,7 +68,7 @@ concurrency:
 jobs:
   ci:
     permissions:
-{ci_perms}    uses: {WF}/service-ci.yaml@{sha} # {ver}
+{ci_perms}    uses: {WF}/service-ci-{CFG['lang']}.yaml@{sha} # {ver}
 {with_block(ci_inputs)}"""
 
 pub_inputs = {"app": svc}
