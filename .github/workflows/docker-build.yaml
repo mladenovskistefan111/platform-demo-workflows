@@ -104,6 +104,8 @@ jobs:
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
+          # Trivy itself (the action's default is older): bump here, in one reviewed place.
+          version: v0.76.1
           image-ref: ${{ needs.build.outputs.staged-image }}
           format: table
           severity: CRITICAL,HIGH
