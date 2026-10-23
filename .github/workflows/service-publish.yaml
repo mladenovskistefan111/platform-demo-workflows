@@ -1192,7 +1192,7 @@ jobs:
           case "$TARGET_ENV" in dev | stage | prod) ;; *) die "env must be dev, stage or prod (got '$TARGET_ENV')" ;; esac
           [[ "$DIGEST" =~ $DIGEST_RE ]] || die "the digest must be sha256:<64 hex> (got '$DIGEST')"
           [[ "$PR_NUMBER" =~ ^[0-9]*$ ]] || die "pull request number '$PR_NUMBER' is not a number"
-          [[ "$WAIT_MINUTES" =~ ^[0-9]+$ ]] && [ "$WAIT_MINUTES" -ge 1 ] && [ "$WAIT_MINUTES" -le 30 ] || die "wait-minutes must be 1 to 30 (got '$WAIT_MINUTES')"
+          if ! [[ "$WAIT_MINUTES" =~ ^[0-9]+$ ]] || [ "$WAIT_MINUTES" -lt 1 ] || [ "$WAIT_MINUTES" -gt 30 ]; then die "wait-minutes must be 1 to 30 (got '$WAIT_MINUTES')"; fi
           if [ -n "$EXPECT_VERSION" ] && ! [[ "$EXPECT_VERSION" =~ $SEMVER ]]; then die "version '$EXPECT_VERSION' is not X.Y.Z"; fi
           file="envs/$TARGET_ENV/values/$APP.yaml"
           pr_url=""
@@ -1692,7 +1692,7 @@ jobs:
           case "$TARGET_ENV" in dev | stage | prod) ;; *) die "env must be dev, stage or prod (got '$TARGET_ENV')" ;; esac
           [[ "$DIGEST" =~ $DIGEST_RE ]] || die "the digest must be sha256:<64 hex> (got '$DIGEST')"
           [[ "$PR_NUMBER" =~ ^[0-9]*$ ]] || die "pull request number '$PR_NUMBER' is not a number"
-          [[ "$WAIT_MINUTES" =~ ^[0-9]+$ ]] && [ "$WAIT_MINUTES" -ge 1 ] && [ "$WAIT_MINUTES" -le 30 ] || die "wait-minutes must be 1 to 30 (got '$WAIT_MINUTES')"
+          if ! [[ "$WAIT_MINUTES" =~ ^[0-9]+$ ]] || [ "$WAIT_MINUTES" -lt 1 ] || [ "$WAIT_MINUTES" -gt 30 ]; then die "wait-minutes must be 1 to 30 (got '$WAIT_MINUTES')"; fi
           if [ -n "$EXPECT_VERSION" ] && ! [[ "$EXPECT_VERSION" =~ $SEMVER ]]; then die "version '$EXPECT_VERSION' is not X.Y.Z"; fi
           file="envs/$TARGET_ENV/values/$APP.yaml"
           pr_url=""
@@ -2414,7 +2414,7 @@ jobs:
           case "$TARGET_ENV" in dev | stage | prod) ;; *) die "env must be dev, stage or prod (got '$TARGET_ENV')" ;; esac
           [[ "$DIGEST" =~ $DIGEST_RE ]] || die "the digest must be sha256:<64 hex> (got '$DIGEST')"
           [[ "$PR_NUMBER" =~ ^[0-9]*$ ]] || die "pull request number '$PR_NUMBER' is not a number"
-          [[ "$WAIT_MINUTES" =~ ^[0-9]+$ ]] && [ "$WAIT_MINUTES" -ge 1 ] && [ "$WAIT_MINUTES" -le 30 ] || die "wait-minutes must be 1 to 30 (got '$WAIT_MINUTES')"
+          if ! [[ "$WAIT_MINUTES" =~ ^[0-9]+$ ]] || [ "$WAIT_MINUTES" -lt 1 ] || [ "$WAIT_MINUTES" -gt 30 ]; then die "wait-minutes must be 1 to 30 (got '$WAIT_MINUTES')"; fi
           if [ -n "$EXPECT_VERSION" ] && ! [[ "$EXPECT_VERSION" =~ $SEMVER ]]; then die "version '$EXPECT_VERSION' is not X.Y.Z"; fi
           file="envs/$TARGET_ENV/values/$APP.yaml"
           pr_url=""
