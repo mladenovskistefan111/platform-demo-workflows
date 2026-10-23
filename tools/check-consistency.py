@@ -258,8 +258,8 @@ for jid, j in pj.items():
             problems.append(f"service-publish.yaml: {jid} must call gitops-promote.yaml at {GITOPS[-40:]}, it calls {j.get('uses')}")
     elif "uses" in j:
         problems.append(f"service-publish.yaml: job {jid} calls another workflow; only deploy, stage and prod (gitops-promote.yaml) may")
-    if jid != "prune" and j.get("continue-on-error"):
-        problems.append(f"service-publish.yaml: only the prune job is best effort, {jid} has continue-on-error")
+    if jid not in ("prune", "release") and j.get("continue-on-error"):
+        problems.append(f"service-publish.yaml: only the prune and release jobs are best effort, {jid} has continue-on-error")
 if pj.get("prune", {}).get("continue-on-error") is not True:
     problems.append("service-publish.yaml: the prune job must have continue-on-error: true (a failed prune never fails a publish)")
 if pj.get("prune", {}).get("if") != "${{ inputs.prune }}":
@@ -379,6 +379,14 @@ for key in ("app-id", "private-key", "owner", "repositories"):
         problems.append(f"service-publish.yaml: release's App token input {key} differs from gitops-promote.yaml")
 if {k: v for k, v in (tok.get("with") or {}).items() if k.startswith("permission-")} != {"permission-contents": "write"}:
     problems.append("service-publish.yaml: release's App token must ask for contents: write and nothing else")
+if rel.get("continue-on-error") is not True:
+    problems.append("service-publish.yaml: the release job must be continue-on-error (a refused tag or release never blocks the prod approval)")
+relay_ = step_by_id(rel, "relay")
+if (rel.get("steps") or [{}])[0] is not relay_ or relay_ is None or set(rel.get("outputs", {})) != {"digest", "tag", "version", "current"} \
+        or any("steps.relay.outputs." not in v for v in rel.get("outputs", {}).values()):
+    problems.append("service-publish.yaml: the release job's outputs must come from its first step (relay), which cannot fail, so a failed release keeps them")
+if "::warning" not in (step_by_id(rel, "release") or {}).get("run", ""):
+    problems.append("service-publish.yaml: a refused release must show as a warning annotation")
 rel_run = (step_by_id(rel, "release") or {}).get("run", "")
 if re.search(r"-X (DELETE|PATCH|PUT)|--force|git push|git tag", rel_run):
     problems.append("service-publish.yaml: the release script must only create (never move, update or delete a tag)")

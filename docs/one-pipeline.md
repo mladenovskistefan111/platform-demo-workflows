@@ -51,7 +51,7 @@ uses; the App needs *Contents: write* and *Pull requests: write* on `platform-de
 | `Approve stage deployment` | environment `stage`. **After** the click: the approval is verified; dev must **still** hold this build's digest (else *superseded*: nothing is promoted); the version is chosen | green, or red (no approval, tags cannot be listed) |
 | `Promote to stage` | the same pinned `gitops-promote.yaml` as `Open dev PR`: env `stage`, this run's digest, the chosen version, auto-merge | |
 | `Wait for stage` | as `Wait for dev`; also checks that the merged file records the expected version | |
-| `Release stage version` | creates the tag and release `<app>-vX.Y.Z` in `platform-demo-helm` (below) | red when GitHub refuses |
+| `Release stage version` | creates the tag and release `<app>-vX.Y.Z` in `platform-demo-helm` (below). **Best effort**: `continue-on-error`, so a refusal never blocks the prod approval | green; when GitHub refuses: a red step, a warning on the run and the reason in the summary, the run itself stays green |
 | `Approve prod deployment` | environment `prod`; same checks after the click, with stage as the previous environment | |
 | `Promote to prod` | `gitops-promote.yaml`, env `prod`, this run's digest, **stage's version** | |
 | `Wait for prod` | as above; the last line of the chain | |
@@ -66,7 +66,8 @@ number: `1.0.10` is above `1.0.9`), tags that are not plain `X.Y.Z` (`-rc1`, ext
 written in `envs/stage/values/<app>.yaml` counts (its tag is made right after the merge). If the stage file already holds this build's
 digest with a version, that version is kept. Prod: **the version of stage, unchanged**. These are the rules of `promote.sh` in the helm
 repository. The version is chosen **after the stage click**, so it is the latest. If the tags cannot be listed the job fails; it never
-guesses `1.0.0`. A minor or major bump is not part of this pipeline.
+guesses `1.0.0`. **A minor or major bump is not part of this pipeline** (no input for it): use the manual **Promote** form of the helm repository,
+which takes an explicit version.
 
 ## The release `<app>-vX.Y.Z`
 
@@ -77,10 +78,12 @@ another digest fails the job), (3) creates the release (notes: digest, image tag
 *latest*) when it does not exist. Run it twice and the second run changes nothing. The tag and the release are two separate calls, so a
 refusal names the call that failed.
 
-If GitHub refuses, the run summary says which call and quotes the answer. *"Resource not accessible by integration"* means the token has no
+**The job is best effort** (`continue-on-error: true`, like the staging prune): if GitHub refuses, the job's result is still *success* for the jobs
+after it, so **the prod approval is not blocked**. The failure is visible as a red step, a warning annotation on the run and a summary that says
+which call failed and quotes the answer. The version is already recorded in the stage file, so nothing is lost. *"Resource not accessible by integration"* means the token has no
 permission (check the App's *Contents: write* and that it is installed on `platform-demo-helm`); *"Repository rule violations"* means a
 ruleset refused it: add the App `platform-demo-promote` to the bypass list of the ruleset `protect-app-release-tags` (Settings -> Rules). Fix it and use
-**Re-run failed jobs**: the chain continues from the release.
+**Re-run failed jobs** to make the release (it is idempotent); it does not matter whether the prod click already happened.
 
 ## Several builds at once
 
@@ -117,9 +120,13 @@ What happens:
 - **Merge, then Reject at the stage prompt.** The run ends red at `Approve stage deployment`; the build stays in dev; the next merge starts
   its own run.
 
-Not covered: two stage promotions whose version is chosen within the minutes between a click and the merge of its pull request can pick the
-same version; the second `Release stage version` then fails ("the tag exists for another image"), the tag is not moved. It needs two clicks
+Known and accepted: two stage promotions whose version is chosen within the minutes between a click and the merge of its pull request can pick the
+same version; the second `Release stage version` then fails loudly (a warning and a red step: "the tag exists for another image") and the tag is not moved. It needs two clicks
 on two different runs within minutes, which the replace-older approval makes unlikely.
+
+**Dev pull request without auto-merge.** `Wait for dev` waits for the dev pull request to merge. If `Publish` is started with `auto-merge: false`
+(a manual dispatch input of the shared workflow; the callers never set it), the pull request waits for a person, `Wait for dev` times out after 25
+minutes **by design** and the chain does not go on. Merge the pull request and use **Re-run failed jobs**: the wait sees the merge.
 
 ## What stops the chain, and what to do
 

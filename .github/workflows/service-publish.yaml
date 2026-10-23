@@ -35,7 +35,8 @@ name: Service publish
 #                           verified, dev must STILL hold this build's digest (else superseded: nothing is promoted, green), the version is chosen
 #   Promote to stage        gitops-promote.yaml (the same pinned file as Open dev PR), env stage, THIS run's digest, auto-merge
 #   Wait for stage          polls the stage pull request until merged (same rules as Wait for dev)
-#   Release stage version   the tag and release <app>-vX.Y.Z in platform-demo-helm, with the GitHub App token; idempotent, a tag is never moved
+#   Release stage version   the tag and release <app>-vX.Y.Z in platform-demo-helm, with the GitHub App token; idempotent, a tag is never moved;
+#                           best effort (continue-on-error): a refusal is a warning and never blocks the prod approval
 #   Approve prod deployment, Promote to prod, Wait for prod   the same three for prod, with stage's version
 #
 # Concurrency: there is NO workflow-level group (the caller has none either): a run waits days for a click, and a group on the whole run
@@ -1844,15 +1845,31 @@ jobs:
     name: "Release stage version"
     needs: [wait-stage]
     if: ${{ needs.wait-stage.outputs.landed == 'true' }}
+    continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions: {}
     outputs:
-      digest: ${{ steps.release.outputs.digest }}
-      tag: ${{ steps.release.outputs.tag }}
-      version: ${{ steps.release.outputs.version }}
-      current: ${{ steps.release.outputs.current }}
+      digest: ${{ steps.relay.outputs.digest }}
+      tag: ${{ steps.relay.outputs.tag }}
+      version: ${{ steps.relay.outputs.version }}
+      current: ${{ steps.relay.outputs.current }}
     steps:
+      - name: Pass on the build for the prod approval
+        id: relay
+        env:
+          DIGEST: ${{ needs.wait-stage.outputs.digest }}
+          TAG: ${{ needs.wait-stage.outputs.tag }}
+          VERSION: ${{ needs.wait-stage.outputs.version }}
+          CURRENT: ${{ needs.wait-stage.outputs.current }}
+        run: |
+          {
+            echo "digest=$DIGEST"
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "current=$CURRENT"
+          } >> "$GITHUB_OUTPUT"
+
       # Short-lived, limited to ONE repository and ONE permission (the same action and pin as gitops-promote.yaml).
       - name: Create a GitHub App token (platform-demo-helm only)
         id: app-token
@@ -1873,7 +1890,6 @@ jobs:
           DIGEST: ${{ needs.wait-stage.outputs.digest }}
           TAG: ${{ needs.wait-stage.outputs.tag }}
           SHA: ${{ needs.wait-stage.outputs.sha }}
-          CURRENT: ${{ needs.wait-stage.outputs.current }}
           SOURCE_REPO: ${{ github.repository }}
           SOURCE_SHA: ${{ github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -1948,10 +1964,12 @@ jobs:
           # The tag and release <app>-vX.Y.Z of platform-demo-helm for the version that stage now runs, on the commit that holds it. The notes
           # hold the digest, so the version stays answerable after stage has moved on. The token is the GitHub App's (scoped to platform-demo-helm).
           # Idempotent: an existing tag is NEVER moved or touched; when it exists for this digest only a missing release is added.
+          # Best effort: the JOB is continue-on-error, a refusal never blocks the prod approval (it is a warning + this summary).
           summary() { cat >> "$GITHUB_STEP_SUMMARY"; }
           stop() {
-            echo "::error::$2"
-            { echo "### Release not made: $1"; echo; echo "$2"; } | summary
+            # best effort: the job is continue-on-error, so a refusal is a warning on a green run and a red job in the graph; the prod approval is not blocked
+            echo "::warning title=Release not made::$1. $2 The pipeline goes on; fix the cause and Re-run failed jobs of this run to make the release."
+            { echo "### Release not made: $1"; echo; echo "$2"; echo; echo "This does not stop the pipeline: the prod approval is not blocked. The version \`$VERSION\` is already recorded in stage. Fix the cause, then use Re-run failed jobs on this run; the release is idempotent."; } | summary
             exit 1
           }
           # $1 = what failed, $2 = what GitHub answered: the answer tells the cause apart
@@ -2035,12 +2053,6 @@ jobs:
             stop "cannot look for the release" "Asking GitHub for the release $name failed: $out"
           fi
 
-          {
-            echo "digest=$DIGEST"
-            echo "tag=$TAG"
-            echo "version=$VERSION"
-            echo "current=$CURRENT"
-          } >> "$GITHUB_OUTPUT"
           {
             echo "### Released \`$name\`"
             echo

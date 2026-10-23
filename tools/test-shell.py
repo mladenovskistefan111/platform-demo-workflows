@@ -1222,7 +1222,7 @@ posts = open(e.log).read().split("gh ")  # the notes have several lines: look at
 posts = [c for c in posts if c.startswith("api -X POST")]
 check("release: creates the tag on the helm commit, then the release (not 'latest'), notes with the digest", rc == 0 and len(posts) == 2
       and f"git/refs -f ref=refs/tags/thing-v1.0.1 -f sha={MSHA}" in posts[0] and "tag_name=thing-v1.0.1" in posts[1] and "make_latest=false" in posts[1]
-      and CD_NEW in posts[1] and "o/app-thing/commit/" in posts[1] and "actions/runs/5" in posts[1] and e.outputs() == {"digest": CD_NEW, "tag": "sha-1234567", "version": "1.0.1", "current": "true"}
+      and CD_NEW in posts[1] and "o/app-thing/commit/" in posts[1] and "actions/runs/5" in posts[1]
       and "### Released `thing-v1.0.1`" in parse_summary(e) and len(writes(e)) == 2, f"rc={rc} {posts} {out}")
 e.done()
 e, env_ = rel_env(tag_refs=["thing-v1.0.1"], releases=["thing-v1.0.1"], files={"stage@thing-v1.0.1": vals(CD_NEW, "1.0.1")})
@@ -1247,6 +1247,20 @@ rc, out = e.run(REL, env_)
 summ = parse_summary(e)
 check("release: a 403 on the tag says which call failed and points at the App's permission", rc != 0 and "creating the tag thing-v1.0.1 failed" in summ
       and "Contents: write" in summ and len(writes(e)) == 1, f"rc={rc} {summ}")
+e.done()
+# best effort: the job is continue-on-error, its outputs come from a first step that cannot fail, and a refusal is a warning
+relay = step(pub["jobs"]["release"], "id", "relay")["run"]
+e = Env()
+rc, out = e.run(relay, {"DIGEST": CD_NEW, "TAG": "sha-1234567", "VERSION": "1.0.1", "CURRENT": "true"})
+check("release: the outputs for the prod approval are written by the first step (they survive a failed release)",
+      rc == 0 and e.outputs() == {"digest": CD_NEW, "tag": "sha-1234567", "version": "1.0.1", "current": "true"}, f"rc={rc} {e.outputs()}")
+e.done()
+check("release: the job is continue-on-error and the relay step comes first", pub["jobs"]["release"].get("continue-on-error") is True
+      and pub["jobs"]["release"]["steps"][0]["id"] == "relay" and pub["jobs"]["approve-prod"]["if"] == "${{ needs.release.outputs.current == 'true' }}")
+e, env_ = rel_env(post_ref_fail="gh: Resource not accessible by integration (HTTP 403)")
+rc, out = e.run(REL, env_)
+check("release: a refusal is a warning annotation and the summary says the prod approval is not blocked", rc != 0 and "::warning title=Release not made::" in out
+      and "::error::" not in out and "the prod approval is not blocked" in parse_summary(e) and "Re-run failed jobs" in parse_summary(e), f"rc={rc} {out}")
 e.done()
 e, env_ = rel_env(post_ref_fail="gh: Repository rule violations found\nCannot create ref due to creations being restricted. (HTTP 422)")
 rc, out = e.run(REL, env_)

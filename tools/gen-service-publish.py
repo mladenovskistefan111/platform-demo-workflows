@@ -836,10 +836,12 @@ RELEASE_SCRIPT = CHAIN_PRE + CHAIN_LIB + r"""
 # The tag and release <app>-vX.Y.Z of platform-demo-helm for the version that stage now runs, on the commit that holds it. The notes
 # hold the digest, so the version stays answerable after stage has moved on. The token is the GitHub App's (scoped to platform-demo-helm).
 # Idempotent: an existing tag is NEVER moved or touched; when it exists for this digest only a missing release is added.
+# Best effort: the JOB is continue-on-error, a refusal never blocks the prod approval (it is a warning + this summary).
 summary() { cat >> "$GITHUB_STEP_SUMMARY"; }
 stop() {
-  echo "::error::$2"
-  { echo "### Release not made: $1"; echo; echo "$2"; } | summary
+  # best effort: the job is continue-on-error, so a refusal is a warning on a green run and a red job in the graph; the prod approval is not blocked
+  echo "::warning title=Release not made::$1. $2 The pipeline goes on; fix the cause and Re-run failed jobs of this run to make the release."
+  { echo "### Release not made: $1"; echo; echo "$2"; echo; echo "This does not stop the pipeline: the prod approval is not blocked. The version \`$VERSION\` is already recorded in stage. Fix the cause, then use Re-run failed jobs on this run; the release is idempotent."; } | summary
   exit 1
 }
 # $1 = what failed, $2 = what GitHub answered: the answer tells the cause apart
@@ -924,12 +926,6 @@ else
 fi
 
 {
-  echo "digest=$DIGEST"
-  echo "tag=$TAG"
-  echo "version=$VERSION"
-  echo "current=$CURRENT"
-} >> "$GITHUB_OUTPUT"
-{
   echo "### Released \`$name\`"
   echo
   echo "- $made"
@@ -974,6 +970,16 @@ else
   echo "::warning::could not read the $TARGET_ENV values file; going on without the newer-build check"
 fi
 echo "stale=$stale" >> "$GITHUB_OUTPUT"
+"""
+
+
+RELAY_SCRIPT = r"""
+{
+  echo "digest=$DIGEST"
+  echo "tag=$TAG"
+  echo "version=$VERSION"
+  echo "current=$CURRENT"
+} >> "$GITHUB_OUTPUT"
 """
 
 
@@ -1046,14 +1052,22 @@ def release_job():
              "          repositories: platform-demo-helm\n"
              "          permission-contents: write")
     env = dict(GH_TOKEN="${{ steps.app-token.outputs.token }}", APP="${{ inputs.app }}", VERSION=f"${{{{ {w}.version }}}}",
-               DIGEST=f"${{{{ {w}.digest }}}}", TAG=f"${{{{ {w}.tag }}}}", SHA=f"${{{{ {w}.sha }}}}", CURRENT=f"${{{{ {w}.current }}}}",
+               DIGEST=f"${{{{ {w}.digest }}}}", TAG=f"${{{{ {w}.tag }}}}", SHA=f"${{{{ {w}.sha }}}}",
                SOURCE_REPO="${{ github.repository }}", SOURCE_SHA="${{ github.sha }}",
                RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")
     step_env = "        env:\n" + "".join(f"          {k}: {v}\n" for k, v in env.items())
-    steps = [token, "      - name: Create the tag and the release\n        id: release\n" + step_env + "        run: |\n" + script(RELEASE_SCRIPT)]
-    outputs = ("    outputs:\n" + "".join(f"      {o}: ${{{{ steps.release.outputs.{o} }}}}\n" for o in ("digest", "tag", "version", "current")).rstrip("\n"))
+    # The first step cannot fail: it hands on what the prod approval needs, so a failed release (continue-on-error) leaves the outputs intact.
+    relay = ("      - name: Pass on the build for the prod approval\n        id: relay\n        env:\n"
+             f"          DIGEST: ${{{{ {w}.digest }}}}\n          TAG: ${{{{ {w}.tag }}}}\n          VERSION: ${{{{ {w}.version }}}}\n          CURRENT: ${{{{ {w}.current }}}}\n"
+             "        run: |\n" + script(RELAY_SCRIPT))
+    steps = [relay, token, "      - name: Create the tag and the release\n        id: release\n" + step_env + "        run: |\n" + script(RELEASE_SCRIPT)]
+    outputs = ("    outputs:\n" + "".join(f"      {o}: ${{{{ steps.relay.outputs.{o} }}}}\n" for o in ("digest", "tag", "version", "current")).rstrip("\n"))
     return render_job("release", name_of("release"), steps, timeout=10, perms="    permissions: {}", needs=["wait-stage"],
-                      cond=f"${{{{ {w}.landed == 'true' }}}}", outputs=outputs)
+                      cond=f"${{{{ {w}.landed == 'true' }}}}", outputs=outputs,
+                      # best effort, like the prune: a refused tag or release (cause not proven yet) never blocks the prod approval.
+                      # With continue-on-error the job's result is `success`, so the approval job below still runs; the failure shows as a red
+                      # step, a warning annotation and the summary
+                      extra=["    continue-on-error: true"])
 
 
 def chain_jobs():
@@ -1115,7 +1129,8 @@ name: Service publish
 #                           verified, dev must STILL hold this build's digest (else superseded: nothing is promoted, green), the version is chosen
 #   Promote to stage        gitops-promote.yaml (the same pinned file as Open dev PR), env stage, THIS run's digest, auto-merge
 #   Wait for stage          polls the stage pull request until merged (same rules as Wait for dev)
-#   Release stage version   the tag and release <app>-vX.Y.Z in platform-demo-helm, with the GitHub App token; idempotent, a tag is never moved
+#   Release stage version   the tag and release <app>-vX.Y.Z in platform-demo-helm, with the GitHub App token; idempotent, a tag is never moved;
+#                           best effort (continue-on-error): a refusal is a warning and never blocks the prod approval
 #   Approve prod deployment, Promote to prod, Wait for prod   the same three for prod, with stage's version
 #
 # Concurrency: there is NO workflow-level group (the caller has none either): a run waits days for a click, and a group on the whole run
