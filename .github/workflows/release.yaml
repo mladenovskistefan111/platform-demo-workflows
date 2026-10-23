@@ -1,0 +1,63 @@
+name: Release
+
+# The tag button. Actions, Release, Run workflow, type the version (vX.Y.Z): an annotated tag is created on the commit that main is
+# at, with the workflow token, so nobody has to run `git tag` in a terminal. The job summary prints the commit SHA that the callers
+# pin (`uses: .../service-publish.yaml@<sha> # vX.Y.Z`).
+# Refuses a version that exists (tags are immutable: a mistake is a new patch version) and any run that is not on main.
+# No approval is asked. To require one, create a GitHub environment `release` with a reviewer and add `environment: release` to the job.
+# A tag made with the workflow token starts no other workflow (events created by GITHUB_TOKEN do not).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, vX.Y.Z (for example v3.4.0)
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  tag:
+    name: Create the tag
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # create the tag
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Check the version
+        run: |
+          if ! [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::'$VERSION' is not a version like v3.4.0 (a leading v and three numbers)"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" > /dev/null 2>&1; then
+            echo "::error::the tag $VERSION already exists. Tags are never moved: pick the next version."
+            exit 1
+          fi
+
+      - name: Create and push the annotated tag
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "Release $VERSION" "$GITHUB_SHA"
+          git push origin "refs/tags/$VERSION"
+          {
+            echo "### Release $VERSION"
+            echo
+            echo "Tag \`$VERSION\` is on commit:"
+            echo
+            echo "    $GITHUB_SHA"
+            echo
+            echo "Callers pin this commit, with the version as a comment:"
+            echo
+            echo "    uses: platform-boutique/platform-demo-workflows/.github/workflows/service-publish.yaml@$GITHUB_SHA # $VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"

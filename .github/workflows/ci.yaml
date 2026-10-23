@@ -14,7 +14,8 @@ jobs:
     uses: ./.github/workflows/workflow-lint.yaml
 
   # The generated workflows are what the generators write, every job has permissions and a timeout, the flat service-ci-<language>
-  # workflows match the stand-alone ones (inputs, guards, pins) and their gate waits for every job (tools/check-consistency.py).
+  # workflows match the stand-alone ones (inputs, guards, pins) and their gate waits for every job; service-publish is flat and
+  # its graph is the documented one (tools/check-consistency.py).
   consistency:
     name: Generated files and conventions
     runs-on: ubuntu-latest
@@ -39,3 +40,8 @@ jobs:
       # the gate script of every service-ci-<language> file, run against success/skip/failure/cancel scenarios
       - name: Gate scenarios
         run: python3 tools/test-gate.py
+
+      # the shell of the image lookup, the Docker Hub copy, change detection with `before`, the prune, the merge job and the tag button,
+      # run against stubs of docker/gh/curl and real git repositories
+      - name: Shell scenarios
+        run: python3 tools/test-shell.py
