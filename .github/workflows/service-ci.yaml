@@ -142,7 +142,7 @@ jobs:
     name: Change detection
     permissions:
       contents: read
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/changed-paths.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/changed-paths.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
 
   # ─── always ───────────────────────────────────────────────────────────────
 
@@ -150,13 +150,13 @@ jobs:
     name: Secret scan
     permissions:
       contents: read
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/secret-scan.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/secret-scan.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
 
   workflow-lint:
     name: Workflow lint
     permissions:
       contents: read
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/workflow-lint.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/workflow-lint.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
 
   # ─── only when code changed: the language workflow (exactly one of these runs) ───
 
@@ -166,7 +166,7 @@ jobs:
     if: ${{ needs.changes.outputs.code == 'true' && inputs.language == 'go' }}
     permissions:
       contents: read
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/go-ci.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/go-ci.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
     with:
       build-path: ${{ inputs.build-path }}
       test-packages: ${{ inputs.test-packages }}
@@ -181,7 +181,7 @@ jobs:
     if: ${{ needs.changes.outputs.code == 'true' && inputs.language == 'node' }}
     permissions:
       contents: read
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/node-ci.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/node-ci.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
     with:
       node-version-file: ${{ inputs.node-version-file }}
       semgrep-config: ${{ inputs.semgrep-config || 'p/typescript p/nodejs p/secrets' }}
@@ -197,7 +197,7 @@ jobs:
     if: ${{ needs.changes.outputs.code == 'true' && inputs.language == 'python' }}
     permissions:
       contents: read
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/python-ci.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/python-ci.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
     with:
       python-version-file: ${{ inputs.python-version-file }}
       source-dir: ${{ inputs.source-dir }}
@@ -212,7 +212,7 @@ jobs:
     if: ${{ needs.changes.outputs.code == 'true' && inputs.language == 'java' }}
     permissions:
       contents: read
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/java-gradle-ci.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/java-gradle-ci.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
     with:
       java-version: ${{ inputs.java-version }}
       java-distribution: ${{ inputs.java-distribution }}
@@ -226,7 +226,7 @@ jobs:
     permissions:
       contents: read
       checks: write # test-reporter publishes a check run
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/dotnet-ci.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/dotnet-ci.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
     with:
       dotnet-version-file: ${{ inputs.dotnet-version-file }}
       solution: ${{ inputs.solution }}

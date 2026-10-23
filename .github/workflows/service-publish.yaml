@@ -92,7 +92,7 @@ jobs:
     name: Change detection
     permissions:
       contents: read
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/changed-paths.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/changed-paths.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
 
   build:
     name: Build, stage and scan
@@ -102,7 +102,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/docker-build.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/docker-build.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
     with:
       context: ${{ inputs.context }}
       dockerfile: ${{ inputs.dockerfile }}
@@ -116,7 +116,7 @@ jobs:
       id-token: write # keyless cosign signing
       contents: read
       packages: read
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/docker-promote.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/docker-promote.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
     with:
       image-name: ${{ inputs.image-name || inputs.app }}
       staged-image: ${{ needs.build.outputs.staged-image }}
@@ -130,7 +130,7 @@ jobs:
     name: Propose to the helm repository
     needs: [promote]
     permissions: {} # gitops-promote works with the GitHub App token, not the workflow's
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
     with:
       app: ${{ inputs.app }}
       env: ${{ inputs.env }}
@@ -150,7 +150,7 @@ jobs:
     if: ${{ inputs.prune }}
     permissions:
       packages: write
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/ghcr-prune.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/ghcr-prune.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
     with:
       package: ${{ github.event.repository.name }}
       keep: ${{ inputs.prune-keep }}
