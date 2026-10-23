@@ -4,7 +4,7 @@
 <span class="pd-kicker">platform · shared CI/CD</span>
 
 Reusable GitHub Actions workflows shared by the platform-demo repositories. Services call these instead of carrying their own
-copy of a 300-line pipeline, so a fix or a version bump lands once. Current release: **v2.0.2** (history below).
+copy of a 300-line pipeline, so a fix or a version bump lands once. Current release: **v3.0.3** (see the version history). Callers pin the release they use by commit SHA: the developer portal calls v3.0.3; the ten service repositories still pin v2.0.2 until they are re-pinned (the Docker workflows are unchanged between the two).
 </div>
 
 <div class="pd-facts" markdown>
