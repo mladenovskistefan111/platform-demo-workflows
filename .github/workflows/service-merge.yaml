@@ -128,7 +128,8 @@ jobs:
           set -euo pipefail
           # A merge made with the workflow token does not fire the push trigger of Publish (events created by GITHUB_TOKEN start no
           # workflows, except workflow_dispatch), so start it explicitly. If the normal GitHub Merge button was used instead, the push
-          # trigger starts Publish by itself and the concurrency group keeps the two runs from overlapping; the second finds the tree image.
+          # trigger starts Publish by itself; if both happen for one commit, the build group of service-publish.yaml lets the second run
+          # wait for the first, and it finds the tree image.
           for attempt in 1 2 3; do
             if gh workflow run publish.yaml --ref main -f before="$BEFORE"; then
               echo "Publish started for main (before=${BEFORE:0:7})." >> "$GITHUB_STEP_SUMMARY"

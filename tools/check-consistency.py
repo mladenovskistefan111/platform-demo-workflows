@@ -29,6 +29,12 @@
    (`continue-on-error`) and never waits for or blocks the helm pull request, the SBOM job is not on the way to it, no job output
    can carry the Docker Hub account name (GitHub drops outputs that contain a secret), every job has the permissions it needs, the
    unchanged steps equal docker-promote.yaml's, and release.yaml exists with a validated version input.
+   Since v3.6 the graph goes on after `Open dev PR` as one straight line (Wait for dev -> Approve stage deployment -> Promote to stage -> Wait for
+   stage -> Release stage version -> Approve prod deployment -> Promote to prod -> Wait for prod): the environments only on the two approval
+   jobs (stage, prod), the job `if`s that skip the rest of the line, the concurrency groups (none at workflow level; image / prune per app
+   without cancel; the approvals with cancel-in-progress), the supersede re-check after the click, the version logic, the same shared helpers in
+   every chain script, the release's App token (same action and inputs as gitops-promote.yaml, contents: write only, never moves a tag),
+   `Promote to stage|prod` pass this run's digest and the chosen version to the same pinned gitops-promote, and the newer-build check of dev.
 Exit code 1 and one line per problem when something is off.
 """
 import os, re, shutil, subprocess, sys, tempfile
@@ -217,12 +223,23 @@ if os.path.exists(os.path.join(wfdir, "service-merge.yaml")) and load("service-m
 
 # 5. service-publish.yaml
 PUBLISH_NAMES = {"changes": "Detect changes", "image": "Find or build image", "scan": "Scan image", "publish": "Publish image",
-                 "sbom": "Create SBOM", "deploy": "Open dev PR", "prune": "Clean up staging images"}
+                 "sbom": "Create SBOM", "deploy": "Open dev PR", "prune": "Clean up staging images",
+                 "wait-dev": "Wait for dev", "approve-stage": "Approve stage deployment", "stage": "Promote to stage",
+                 "wait-stage": "Wait for stage", "release": "Release stage version", "approve-prod": "Approve prod deployment",
+                 "prod": "Promote to prod", "wait-prod": "Wait for prod"}
 PUBLISH_NEEDS = {"changes": None, "image": ["changes"], "scan": ["image"], "publish": ["image", "scan"], "sbom": ["publish"],
-                 "deploy": ["publish"], "prune": ["publish"]}
+                 "deploy": ["publish"], "prune": ["publish"],
+                 # after `Open dev PR` a straight line: dev -> stage -> prod; sbom and prune stay parallel branches. The wait jobs also need
+                 # the job that has the digest (a nested workflow call has no outputs of its own besides pr-url and pr-number)
+                 "wait-dev": ["publish", "deploy"], "approve-stage": ["wait-dev"], "stage": ["approve-stage"],
+                 "wait-stage": ["approve-stage", "stage"], "release": ["wait-stage"], "approve-prod": ["release"], "prod": ["approve-prod"],
+                 "wait-prod": ["approve-prod", "prod"]}
 PUBLISH_PERMS = {"changes": {"contents": "read"}, "image": {"contents": "read", "packages": "write"},
                  "scan": {"contents": "read", "packages": "read"}, "publish": {"id-token": "write", "contents": "read", "packages": "read"},
-                 "sbom": {"id-token": "write", "contents": "read"}, "deploy": {}, "prune": {"contents": "read", "packages": "write"}}
+                 "sbom": {"id-token": "write", "contents": "read"}, "deploy": {}, "prune": {"contents": "read", "packages": "write"},
+                 "wait-dev": {}, "approve-stage": {"actions": "read"}, "stage": {}, "wait-stage": {}, "release": {}, "approve-prod": {"actions": "read"},
+                 "prod": {}, "wait-prod": {}}
+NESTED_PROMOTE = {"deploy", "stage", "prod"}  # the jobs that call gitops-promote.yaml
 GITOPS = "platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@341f641320553ad73969b637ff125466e6b2d99c"
 pub_text = open(os.path.join(wfdir, "service-publish.yaml")).read()
 pub = load("service-publish.yaml")
@@ -236,11 +253,11 @@ for jid, j in pj.items():
         problems.append(f"service-publish.yaml: job {jid} needs {j.get('needs')}, expected {PUBLISH_NEEDS.get(jid)}")
     if (j.get("permissions") or {}) != PUBLISH_PERMS.get(jid):
         problems.append(f"service-publish.yaml: job {jid} permissions are {j.get('permissions')}, expected {PUBLISH_PERMS.get(jid)}")
-    if jid == "deploy":
+    if jid in NESTED_PROMOTE:
         if j.get("uses", "").split(" ")[0] != GITOPS:
-            problems.append(f"service-publish.yaml: deploy must call gitops-promote.yaml at {GITOPS[-40:]}, it calls {j.get('uses')}")
+            problems.append(f"service-publish.yaml: {jid} must call gitops-promote.yaml at {GITOPS[-40:]}, it calls {j.get('uses')}")
     elif "uses" in j:
-        problems.append(f"service-publish.yaml: job {jid} calls another workflow; only deploy (gitops-promote.yaml) may")
+        problems.append(f"service-publish.yaml: job {jid} calls another workflow; only deploy, stage and prod (gitops-promote.yaml) may")
     if jid != "prune" and j.get("continue-on-error"):
         problems.append(f"service-publish.yaml: only the prune job is best effort, {jid} has continue-on-error")
 if pj.get("prune", {}).get("continue-on-error") is not True:
@@ -249,8 +266,124 @@ if pj.get("prune", {}).get("if") != "${{ inputs.prune }}":
     problems.append("service-publish.yaml: prune must run only with `if: ${{ inputs.prune }}`")
 if pj.get("image", {}).get("if") != "${{ needs.changes.outputs.code == 'true' && github.ref == 'refs/heads/main' }}":
     problems.append("service-publish.yaml: image must run only for code changes on main")
-if set(pj.get("publish", {}).get("outputs", {})) != {"digest", "tag"}:
-    problems.append("service-publish.yaml: the publish job outputs must be exactly digest and tag (an output with the Docker Hub account name is dropped by GitHub)")
+if set(pj.get("publish", {}).get("outputs", {})) != {"digest", "tag", "stale"}:
+    problems.append("service-publish.yaml: the publish job outputs must be exactly digest, tag and stale (an output with the Docker Hub account name is dropped by GitHub)")
+def step_by_id(job, sid):
+    return next((s_ for s_ in job.get("steps", []) if s_.get("id") == sid), None)
+
+# ---- a slower older run must not move dev back: `Open dev PR` is skipped when dev already runs a newer commit ----
+guard_ = step_by_id(pj.get("publish", {}), "dev-guard")
+if (pj.get("publish", {}).get("steps") or [{}])[-1] is not guard_ or guard_ is None:
+    problems.append("service-publish.yaml: the last step of publish must be the dev-guard step")
+elif "= behind" not in guard_["run"] or "compare/${BASH_REMATCH[1]}...$GITHUB_SHA" not in guard_["run"] or "stale=$stale" not in guard_["run"]:
+    problems.append("service-publish.yaml: the dev-guard step must compare dev's sha-<7> tag with this commit and set stale when this commit is behind it")
+if pj.get("deploy", {}).get("if") != "${{ needs.publish.outputs.stale != 'true' }}":
+    problems.append("service-publish.yaml: deploy must be skipped when publish says stale")
+
+# ---- the chain after `Open dev PR`: dev -> stage -> prod in the same run ----
+
+CHAIN_IF = {"wait-dev": "${{ inputs.env == 'dev' }}", "approve-stage": "${{ needs.wait-dev.outputs.current == 'true' }}",
+            "stage": "${{ needs.approve-stage.outputs.go == 'true' }}", "release": "${{ needs.wait-stage.outputs.landed == 'true' }}",
+            "approve-prod": "${{ needs.release.outputs.current == 'true' }}", "prod": "${{ needs.approve-prod.outputs.go == 'true' }}",
+            "wait-stage": None, "wait-prod": None}
+for jid, want in CHAIN_IF.items():
+    if pj.get(jid, {}).get("if") != want:
+        problems.append(f"service-publish.yaml: job {jid} has `if: {pj.get(jid, {}).get('if')}`, expected {want}")
+for jid in PUBLISH_NEEDS:
+    if jid in CHAIN_IF and ("sbom" in (pj.get(jid, {}).get("needs") or []) or "prune" in (pj.get(jid, {}).get("needs") or [])):
+        problems.append(f"service-publish.yaml: chain job {jid} waits for sbom or prune; they stay parallel branches")
+# the environments: only the two approvals, and only stage / prod (never another name)
+for jid, j in pj.items():
+    want = {"approve-stage": "stage", "approve-prod": "prod"}.get(jid)
+    if j.get("environment") != want:
+        problems.append(f"service-publish.yaml: job {jid} has environment {j.get('environment')!r}, expected {want!r}")
+# concurrency: no workflow-level group (a run may wait days for a click); job groups per app; approvals replace older waiting ones
+if "concurrency" in pub:
+    problems.append("service-publish.yaml: has a workflow-level concurrency group; a run waiting for a click would block later merges")
+CONC = {"image": ("publish-build-${{ inputs.app }}", False), "prune": ("publish-prune-${{ inputs.app }}", False),
+        "approve-stage": ("promote-stage-${{ inputs.app }}", True), "approve-prod": ("promote-prod-${{ inputs.app }}", True)}
+for jid, j in pj.items():
+    got = j.get("concurrency")
+    want = CONC.get(jid)
+    if want is None:
+        if got is not None:
+            problems.append(f"service-publish.yaml: job {jid} has a concurrency group; only {sorted(CONC)} may (gitops-promote.yaml serialises the pull requests itself)")
+    elif got != {"group": want[0], "cancel-in-progress": want[1]}:
+        problems.append(f"service-publish.yaml: job {jid} concurrency is {got}, expected group {want[0]!r} with cancel-in-progress {want[1]}")
+# the approval jobs: same two scripts; approval verified; the supersede re-check is the first decision after the click
+ap = {k: pj.get(k, {}) for k in ("approve-stage", "approve-prod")}
+ap_steps = {k: [s_.get("id") for s_ in v.get("steps", [])] for k, v in ap.items()}
+if any(v != ["approval", "decide"] for v in ap_steps.values()):
+    problems.append(f"service-publish.yaml: the approval jobs must have the steps approval, decide (they have {ap_steps})")
+else:
+    for sid in ("approval", "decide"):
+        if step_by_id(ap["approve-stage"], sid)["run"] != step_by_id(ap["approve-prod"], sid)["run"]:
+            problems.append(f"service-publish.yaml: the {sid} step of both approval jobs must be the same script")
+    decide = step_by_id(ap["approve-stage"], "decide")["run"]
+    approval = step_by_id(ap["approve-stage"], "approval")["run"]
+    if 'if [ "$prev_digest" != "$DIGEST" ]; then' not in decide or "go=false" not in decide or "superseded by a newer build" not in decide:
+        problems.append("service-publish.yaml: the decide step lacks the supersede re-check (the previous environment must still hold this run's digest)")
+    if not 0 <= decide.find('if [ "$prev_digest" != "$DIGEST" ]') < decide.find("next_version \"$APP\""):
+        problems.append("service-publish.yaml: the supersede re-check must come before the version is chosen")
+    if "/approvals" not in approval or '.state == "approved"' not in approval or "exit 1" not in approval:
+        problems.append("service-publish.yaml: the approval step must refuse to go on without an approval of the environment (a missing environment has no protection)")
+    for fragment in ("LC_ALL=C sort -V", "SEMVER=", "matching-refs/tags/$1-v", "echo 1.0.0"):
+        if fragment not in decide:
+            problems.append(f"service-publish.yaml: the version logic lacks {fragment!r} (helm's promote.sh: next patch after the highest <app>-vX.Y.Z tag, none: 1.0.0)")
+    for k, v in ap.items():
+        env_ = v.get("env", {})
+        if env_.get("ENVIRONMENT") != env_.get("TARGET_ENV") or env_.get("ENVIRONMENT") != {"approve-stage": "stage", "approve-prod": "prod"}[k]:
+            problems.append(f"service-publish.yaml: {k} asks the approval of the wrong environment")
+# the nested promotions: this run's digest only, the computed version, the same secrets as Open dev PR
+for jid, envname, ap_ in (("stage", "stage", "approve-stage"), ("prod", "prod", "approve-prod")):
+    w = pj.get(jid, {}).get("with", {})
+    a_ = f"${{{{ needs.{ap_}.outputs.%s }}}}"
+    for key, want in (("env", envname), ("image-digest", a_ % "digest"), ("image-tag", a_ % "tag"), ("version", a_ % "version"),
+                      ("source-sha", "${{ github.sha }}"), ("source-repository", "${{ github.repository }}"), ("auto-merge", "${{ inputs.auto-merge }}")):
+        if w.get(key) != want:
+            problems.append(f"service-publish.yaml: {jid} passes {key}={w.get(key)!r}, expected {want!r}")
+    if pj.get(jid, {}).get("secrets") != pj.get("deploy", {}).get("secrets"):
+        problems.append(f"service-publish.yaml: {jid} must pass the same secrets as deploy")
+# the wait jobs: one script, polling with a limit below the job timeout, all outputs, helm read with the job's own (public) token
+waits = {k: pj.get(k, {}) for k in ("wait-dev", "wait-stage", "wait-prod")}
+if len({step_by_id(v, "wait")["run"] for v in waits.values() if step_by_id(v, "wait")}) != 1:
+    problems.append("service-publish.yaml: the three wait jobs must run the same script")
+for k, v in waits.items():
+    if set(v.get("outputs", {})) != {"landed", "current", "sha", "version", "digest", "tag"}:
+        problems.append(f"service-publish.yaml: {k} outputs are {sorted(v.get('outputs', {}))}")
+    if v.get("env", {}).get("WAIT_MINUTES") != "25" or v.get("timeout-minutes", 0) < 30:
+        problems.append(f"service-publish.yaml: {k} must wait 25 minutes and have a job timeout above 30")
+    if v.get("env", {}).get("GH_TOKEN") != "${{ github.token }}":
+        problems.append(f"service-publish.yaml: {k} reads the public helm repository with the job's own token")
+# every chain script writes the run summary, on the failure paths too, and the version checks do not drift between the shared copies
+LIB_START, LIB_END = "HELM=platform-boutique/platform-demo-helm", "  return 1\n}\n"
+libs = {}
+for jid, sid in (("wait-dev", "wait"), ("approve-stage", "decide"), ("release", "release")):
+    run_ = (step_by_id(pj.get(jid, {}), sid) or {}).get("run", "")
+    if "GITHUB_STEP_SUMMARY" not in run_ or "summary()" not in run_:
+        problems.append(f"service-publish.yaml: the {sid} step of {jid} writes no run summary")
+    if LIB_START in run_:
+        libs[jid] = run_[run_.index(LIB_START):run_.index(LIB_END, run_.index("values_retry()")) + len(LIB_END)]
+    else:
+        problems.append(f"service-publish.yaml: the {sid} step of {jid} lacks the shared helm helpers")
+if len(set(libs.values())) > 1:
+    problems.append("service-publish.yaml: the shared helm helpers (values file parsing, values_file) differ between the chain scripts")
+# the release: App token for platform-demo-helm only, the same action and inputs as gitops-promote.yaml, never moves or deletes anything
+rel = pj.get("release", {})
+tok = step_by_id(rel, "app-token") or {}
+gp_tok = next((s_ for s_ in load("gitops-promote.yaml")["jobs"]["promote"]["steps"] if s_.get("id") == "app-token"), {})
+if tok.get("uses") != gp_tok.get("uses"):
+    problems.append("service-publish.yaml: release mints the App token with another action pin than gitops-promote.yaml")
+for key in ("app-id", "private-key", "owner", "repositories"):
+    if (tok.get("with") or {}).get(key) != (gp_tok.get("with") or {}).get(key):
+        problems.append(f"service-publish.yaml: release's App token input {key} differs from gitops-promote.yaml")
+if {k: v for k, v in (tok.get("with") or {}).items() if k.startswith("permission-")} != {"permission-contents": "write"}:
+    problems.append("service-publish.yaml: release's App token must ask for contents: write and nothing else")
+rel_run = (step_by_id(rel, "release") or {}).get("run", "")
+if re.search(r"-X (DELETE|PATCH|PUT)|--force|git push|git tag", rel_run):
+    problems.append("service-publish.yaml: the release script must only create (never move, update or delete a tag)")
+if (step_by_id(rel, "release") or {}).get("env", {}).get("GH_TOKEN") != "${{ steps.app-token.outputs.token }}":
+    problems.append("service-publish.yaml: the release must use the App token")
 for old in ("docker-build.yaml", "docker-promote.yaml", "ghcr-prune.yaml", "changed-paths.yaml"):
     if re.search(r"uses: .*" + re.escape(old), pub_text):
         problems.append(f"service-publish.yaml: calls {old}; everything except gitops-promote.yaml must be inline")
@@ -278,9 +411,6 @@ copy_runs = [s_.get("run", "") for s_ in pj.get("publish", {}).get("steps", []) 
 if len(copy_runs) != 1 or copy_runs[0].count("--tag") != 1 or 'tag="sha-${GITHUB_SHA::7}"' not in copy_runs[0]:
     problems.append("service-publish.yaml: the Docker Hub copy must make exactly one tag, sha-<first 7 chars of the commit>")
 # steps shared with the pull-request image job are the same text
-def step_by_id(job, sid):
-    return next((s_ for s_ in job.get("steps", []) if s_.get("id") == sid), None)
-
 for lang, image in flat_images.items():
     for sid in ("find", "image", "mode", "cache"):
         a, b = step_by_id(image, sid), step_by_id(pj["image"], sid)
@@ -308,6 +438,8 @@ if tb and tb[0]["with"]["image-ref"] != "${{ needs.image.outputs.ref }}":
 # the other publish summaries: the publish job writes the answer, scan and SBOM write their own section
 for jid_, sect in (("publish", "### Published"), ("sbom", "### SBOM"), ("scan", "### Image scan")):
     last = (pj.get(jid_, {}).get("steps") or [{}])[-1]
+    if jid_ == "publish":  # the answer to "what was published" is followed by the newer-build check of dev
+        last = (pj.get(jid_, {}).get("steps") or [{}, {}])[-2]
     if last.get("name") != "Write the run summary" or sect not in last.get("run", ""):
         problems.append(f"service-publish.yaml: the last step of job {jid_} must be 'Write the run summary' with the section {sect!r}")
 # pins

@@ -5,6 +5,7 @@ edit_uri: edit/main/docs/
 nav:
   - Overview: index.md
   - How a service calls them: calling.md
+  - One pipeline (merge to prod): one-pipeline.md
   - Build once per tree: build-once.md
   - Release model: release-model.md
   - Dependabot: dependabot.md

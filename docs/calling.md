@@ -10,18 +10,18 @@ on: { pull_request: { branches: [main] }, workflow_dispatch: }
 permissions: {}
 concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }
 jobs:
-  ci: { permissions: { contents: read, packages: write }, uses: .../service-ci-go.yaml@<sha> # v3.5.0, with: { test-packages: ..., ... } }
+  ci: { permissions: { contents: read, packages: write }, uses: .../service-ci-go.yaml@<sha> # v3.6.0, with: { test-packages: ..., ... } }
   # service-ci-<go|node|python|java|dotnet|none>.yaml; only dotnet also needs checks: write (test reporter); product-catalog-db: -none with image: false
   merge:                                  # the merge button: NOT part of `gate`, after it; the logic is service-merge.yaml
     needs: ci
     if: pull_request, same repository, not Dependabot
     permissions: { contents: write, pull-requests: write, actions: write }
-    uses: .../service-merge.yaml@<sha> # v3.5.0   (product-catalog-db: with: { start-publish: false })
+    uses: .../service-merge.yaml@<sha> # v3.6.0   (product-catalog-db: with: { start-publish: false })
 # .github/workflows/publish.yaml (shape)
 on: { push: { branches: [main] }, workflow_dispatch: { inputs: { before: {type: string, default: ""} } } }
-concurrency: { group: publish-${{ github.ref }}, cancel-in-progress: false }
+# no workflow-level concurrency: the run waits days for the stage / prod click (see "One pipeline")
 jobs:
-  publish: { permissions: { contents: read, packages: write, id-token: write }, uses: .../service-publish.yaml@<sha> # v3.5.0,
+  publish: { permissions: { contents: read, packages: write, id-token: write, actions: read }, uses: .../service-publish.yaml@<sha> # v3.6.0,
              with: { app: checkout-service, before: "${{ inputs.before }}" }, secrets: DOCKERHUB_USERNAME / DOCKERHUB_TOKEN / PROMOTE_APP_ID / PROMOTE_APP_PRIVATE_KEY }
 ```
 
@@ -53,8 +53,11 @@ is no placeholder pin or two-step release.
 
 ```
 Detect changes -> Find or build image -> Scan image -> Publish image -+-> Create SBOM
-                                                                      +-> Open dev PR   (gitops-promote.yaml)
                                                                       +-> Clean up staging images (best effort)
+                                                                      +-> Open dev PR   (gitops-promote.yaml) -> Wait for dev
+                                                                            -> Approve stage deployment -> Promote to stage -> Wait for stage
+                                                                            -> Release stage version
+                                                                            -> Approve prod deployment -> Promote to prod -> Wait for prod
 ```
 
 | Job | What it does |
@@ -64,11 +67,13 @@ Detect changes -> Find or build image -> Scan image -> Publish image -+-> Create
 | `Scan image` | Trivy (HIGH/CRITICAL fail) on that digest, again: new CVEs may have appeared since the pull request |
 | `Publish image` | refuses commits not reachable from `main`; copies the digest to Docker Hub as `sha-<7 chars of the commit>` only (no `latest`, no semver), never moves an existing tag, **fails hard if the Docker Hub digest differs from the scanned one**, cosign signs (keyless) and verifies. Its run summary answers "what was published": tag, commit, digest, reused or built, signature, where the dev change goes |
 | `Create SBOM` | SPDX SBOM as a signed attestation, verified. Own job, so it is not on the way to the helm pull request; a failure fails the run visibly |
-| `Open dev PR` | the pull request in the helm repository that moves `dev` to this digest (`permissions: {}`, App token) |
+| `Open dev PR` | the pull request in the helm repository that moves `dev` to this digest (`permissions: {}`, App token); skipped when dev already runs a newer commit (last step of `Publish image`) |
+| `Wait for dev` ... `Wait for prod` | the promotion to stage and prod in the same run, with your clicks: see [One pipeline](one-pipeline.md) |
 | `Clean up staging images` | `continue-on-error: true`, never delays the helm pull request: keeps the newest `prune-keep` (10) `sha-*` and the newest `prune-keep-tree` (20) `tree-*` versions of the ghcr.io package, never the `buildcache` package, never an image-index child of a kept image |
 
-Concurrency (`publish-<ref>`, no cancel) lives in the caller: one publish at a time. **A run that waits behind a running one is replaced by
-a newer waiting one**, so of three quick merges the second never publishes by itself; the third publishes the tree of `main`, which contains
+Concurrency: since v3.6.0 there is no workflow-level group (a run waits days for a click and would block every later merge); the jobs
+that must not overlap have their own groups per app (see [One pipeline](one-pipeline.md)). **A build that waits behind a running one is replaced by
+a newer waiting one**, so of three quick merges the second never builds by itself; the third builds the tree of `main`, which contains
 it. Callers always pin to a **commit SHA** with the version in a trailing comment. A reusable workflow can never get more permissions than
 its caller grants, so each job lists what it needs (`id-token: write` only on the jobs that sign). Secrets: `DOCKERHUB_USERNAME` and
 `DOCKERHUB_TOKEN` (per service repository), `PROMOTE_APP_ID` and `PROMOTE_APP_PRIVATE_KEY` (organisation secrets, GitHub App scoped to
@@ -91,8 +96,8 @@ environment `merge` (required reviewer: the owner). On the run page: **Review de
 the run was approved, that the branch still is the tested commit, squash-merges the pull request
 (`gh pr merge --squash --delete-branch`, title and body from the pull request) with the workflow token and starts `Publish`
 (`gh workflow run publish.yaml --ref main -f before=<main before the merge>`). A merge made with the workflow token does not fire the push
-trigger, hence the explicit start; the normal GitHub Merge button still works and starts Publish by push, and the concurrency group keeps
-the two apart (a second run finds the tree image). The caller file is the pull request's own: **read a change to `.github/workflows`
+trigger, hence the explicit start; the normal GitHub Merge button still works and starts Publish by push (if both ever happen for the same
+commit, the build group lets the second run wait and find the tree image). The caller file is the pull request's own: **read a change to `.github/workflows`
 before you approve it.** Fork and Dependabot pull requests have no `merge` job (read-only token): use the normal button.
 
 ### Job names and run summaries
@@ -126,6 +131,14 @@ missing `name:`; the gate reads job **ids** from `needs`, never names (it only p
 | `sbom` | Create SBOM | Publish: SBOM |
 | `deploy` | Open dev PR | Deploy: Open dev PR |
 | `prune` | Clean up staging images | Cleanup: Prune staging |
+| `wait-dev` | Wait for dev | (new in v3.6.0) |
+| `approve-stage` | Approve stage deployment | (new) |
+| `stage` | Promote to stage | (new) |
+| `wait-stage` | Wait for stage | (new) |
+| `release` | Release stage version | (new) |
+| `approve-prod` | Approve prod deployment | (new) |
+| `prod` | Promote to prod | (new) |
+| `wait-prod` | Wait for prod | (new) |
 
 `service-merge` keeps `Approve and merge`.
 
@@ -143,6 +156,9 @@ ids in code, no emojis in headings. A summary belongs to one job, so every job w
 | publish | `Create SBOM` | **SBOM**: attached to the digest as a signed attestation, verified |
 | publish | `Open dev PR` | the section of `gitops-promote.yaml` (unchanged): link to the helm pull request, tag, digest, source commit |
 | publish | `Clean up staging images` | versions before, deleted, remaining, failures; the deleted list folded in `<details>` |
+| publish | `Wait for dev` / `Wait for stage` / `Wait for prod` | **Dev deployed** / **Stage deployed: version X.Y.Z** / **Prod deployed** with the helm pull request link; or *superseded by a newer build* (green), or why the chain stopped; `Wait for prod` ends with "The chain is complete" |
+| publish | `Approve stage deployment` / `Approve prod deployment` | **Stage approved by <who>**: version (and how it was chosen), old -> new digest; or *not promoted: superseded by a newer build* |
+| publish | `Release stage version` | **Released `<app>-vX.Y.Z`**: tag, release link, digest, helm commit |
 
 Limits and care: GitHub rejects a step summary over 1 MiB, so lists are cut (50 file names, at most 100 deleted versions). File names,
 tags and caller inputs are untrusted text: they appear only inside code spans, as printable ASCII (anything else becomes `?`), without

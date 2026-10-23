@@ -48,10 +48,11 @@ A re-run is cheap and consistent: the build pushed the tag, so the second run fi
 - **The registry build cache** (`ghcr.io/<repo>/buildcache`, mode=max) is written by the publish when it builds and by every pull-request
   run that pushes the image (same repository, not Dependabot), so the next build starts from the newest layers. Forks and Dependabot only
   read it. A run that reuses an existing tree image builds nothing and writes nothing.
-- **A third merge replaces the pending one.** The caller's concurrency group `publish-<ref>` runs one publish at a time and keeps only the
-  newest waiting run. The replaced run's tree is contained in the newest one, so it is published with it. Exception: if the replaced merge
-  changed code and the last one is documentation-only, the last run's `before` is the replaced merge, the diff is docs-only and nothing is
-  published. Start `Publish` by hand without `before` (Actions, Publish, Run workflow) to publish the code.
+- **A third merge replaces the pending build.** Since v3.6.0 the job `Find or build image` has its own group `publish-build-<app>` (the
+  callers have no workflow-level group any more: a run that waits for a stage or prod click would block every later merge). It builds one
+  tree at a time and keeps only the newest waiting run. The replaced run's tree is contained in the newest one, so it is published with it.
+  A documentation-only run never enters the group, so it cannot replace a pending code run (the old exception is gone). See
+  [One pipeline](one-pipeline.md) for what several runs do after the build.
 - **Dependabot pull requests** get a read-only token: they build locally, and have no `merge` job; use the normal Merge button.
 
 ## Staging package on ghcr.io
@@ -78,7 +79,7 @@ It runs next to the helm pull request, has `continue-on-error: true` and never d
 5. reads the commit `main` had before the merge (the parent of the squash commit) and starts `Publish` with it as `before`: events created
    with the workflow token start no workflows except `workflow_dispatch`, so the push trigger does not fire for this merge.
 
-The normal GitHub Merge button still works and starts `Publish` by push. If both happened for the same tree, the concurrency group lets one
+The normal GitHub Merge button still works and starts `Publish` by push. If both happened for the same tree, the build group lets one
 run after the other and the second finds the tree image (it signs and attests again; nothing else changes).
 
 **Security.** The job runs the workflow files of the pull request (that is how `pull_request` workflows work), but only after a person
@@ -103,6 +104,8 @@ shows as waiting on the pull request until it is approved and is not required.
 
 ## Settings the owner must create
 
+- The promotion clicks of the same run need the environments **`stage`** and **`prod`** in every app repository as well (required reviewer = the
+  owner, *Prevent self-review* off, deployment branches: main only): see [One pipeline](one-pipeline.md).
 - In every app repository (the 10 that have a Publish and product-catalog-db, which has only the merge button): a GitHub **environment
   `merge`** with the owner as **required reviewer**; "Prevent self-review" **off** (the owner opens the pull requests); no deployment
   branch restriction (the job runs on the pull request's merge ref).
