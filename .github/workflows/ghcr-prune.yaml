@@ -1,0 +1,253 @@
+name: Prune ghcr.io staging images
+
+# Keeps the staging package on ghcr.io small. Called at the END of an app's publish workflow with the caller's own GITHUB_TOKEN:
+#   uses: platform-boutique/platform-demo-workflows/.github/workflows/ghcr-prune.yaml@<tag or sha>
+#   permissions: { packages: write, contents: read }
+#   with: { package: app-checkout-service }          # the package name = the repository name; add `dry-run: true` for the first run
+#
+# What it does to ghcr.io/<owner>/<package> (container package, owner = the organisation of the calling repository):
+#   - keeps the newest `keep` versions that carry a `sha-*` tag (the images that were built from main);
+#   - deletes the older `sha-*` versions;
+#   - deletes untagged versions older than `untagged-days` (7), EXCEPT every manifest that a kept (or otherwise tagged) image index
+#     points to: a multi-platform image / buildx attestation is an index whose children show up as untagged versions, and deleting
+#     one would break the tagged image;
+#   - never deletes a version that has a tag which is not `sha-*` (latest, v1.2.3, ...);
+#   - never touches another package: `package` must be a plain name, so `<package>/buildcache` (the build cache) cannot be named;
+#   - refuses to delete anything when the listing looks wrong, when nothing would be kept, or when the newest version would go;
+#   - deletes at most 100 versions per run (the next run continues), and a failed delete never stops the others.
+# `dry-run: true` prints exactly what a real run would delete and deletes nothing. Docker Hub is not pruned here.
+#
+# The token needs the admin role on the package: GitHub gives it to the repository that published the package from a workflow, but
+# an existing package may need it granted once (Package settings > Manage Actions access > role Admin).
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: Container package name under the organisation, e.g. app-checkout-service (no slash)
+        type: string
+        required: true
+      keep:
+        description: How many of the newest sha-* versions to keep
+        type: number
+        default: 10
+      untagged-days:
+        description: Untagged versions older than this are deleted (unless a kept image points to them)
+        type: number
+        default: 7
+      dry-run:
+        description: Only print what would be deleted
+        type: boolean
+        default: false
+
+# Least privilege by default; the job below declares what it needs.
+permissions: {}
+
+jobs:
+  prune:
+    name: Prune ${{ inputs.package }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      packages: write
+      contents: read
+    # two runs of the same package (two quick merges) must not delete concurrently
+    concurrency:
+      group: ghcr-prune-${{ inputs.package }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OWNER: ${{ github.repository_owner }}
+      PACKAGE: ${{ inputs.package }}
+      KEEP: ${{ inputs.keep }}
+      UNTAGGED_DAYS: ${{ inputs.untagged-days }}
+      DRY_RUN: ${{ inputs.dry-run }}
+    steps:
+      - name: Select and delete
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, re, subprocess, sys
+          from datetime import datetime, timedelta, timezone
+
+          owner, package = os.environ["OWNER"].lower(), os.environ["PACKAGE"]
+          dry_run = os.environ["DRY_RUN"] == "true"
+          MAX_DELETE = 100
+
+
+          def die(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+
+          try:
+              keep = int(float(os.environ["KEEP"]))
+              untagged_days = int(float(os.environ["UNTAGGED_DAYS"]))
+          except ValueError:
+              die("keep and untagged-days must be numbers")
+          if keep < 1 or untagged_days < 1:
+              die("keep and untagged-days must be at least 1")
+          # a plain package name only: "<package>/buildcache" (and anything else with a slash) can never be addressed
+          if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", package):
+              die(f"package '{package}' is not a plain container package name (lower case, no slash)")
+          if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", owner):
+              die(f"unexpected owner '{owner}'")
+
+          api = f"orgs/{owner}/packages/container/{package}/versions"
+
+
+          def gh(*args, check=True):
+              p = subprocess.run(["gh", *args], capture_output=True, text=True)
+              if check and p.returncode != 0:
+                  die(f"gh {' '.join(args[:2])} failed: {(p.stderr or p.stdout).strip()[:300]}")
+              return p
+
+
+          # ---- list (all pages) ------------------------------------------------------------------------------------------
+          p = gh("api", "--paginate", f"{api}?state=active&per_page=100", check=False)
+          if p.returncode != 0:
+              if "404" in p.stderr + p.stdout:
+                  print(f"::notice::package {owner}/{package} does not exist (yet); nothing to prune")
+                  sys.exit(0)
+              die(f"listing failed: {(p.stderr or p.stdout).strip()[:300]}")
+          versions, dec, text, pos = [], json.JSONDecoder(), p.stdout.strip(), 0
+          while pos < len(text):                      # --paginate prints one JSON array per page
+              page, end = dec.raw_decode(text, pos)
+              versions += page
+              pos = end
+              while pos < len(text) and text[pos].isspace():
+                  pos += 1
+          for v in versions:
+              try:
+                  assert isinstance(v["id"], int) and v["name"].startswith("sha256:")
+                  v["_created"] = datetime.fromisoformat(v["created_at"].replace("Z", "+00:00"))
+                  v["_tags"] = v["metadata"]["container"]["tags"]
+                  assert isinstance(v["_tags"], list)
+              except (KeyError, TypeError, AssertionError, ValueError):
+                  die(f"the listing looks wrong (unexpected version object: {json.dumps({k: v[k] for k in ('id', 'name', 'created_at', 'metadata') if k in v}, default=str)[:200]}); nothing was deleted")
+          if not versions:
+              print(f"::notice::package {owner}/{package} has no versions; nothing to prune")
+              sys.exit(0)
+          versions.sort(key=lambda v: v["_created"], reverse=True)
+          now = datetime.now(timezone.utc)
+          cutoff = now - timedelta(days=untagged_days)
+
+
+          # ---- classify ----------------------------------------------------------------------------------------------------
+          def sha_tagged(v):
+              return any(t.startswith("sha-") for t in v["_tags"])
+
+
+          def protected(v):                           # a tag that is not sha-*: latest, v1.2.3, ...
+              return any(not t.startswith("sha-") for t in v["_tags"])
+
+
+          ranked = [v for v in versions if sha_tagged(v)]
+          kept = ranked[:keep]
+          old_tagged = ranked[keep:]
+          anchors = kept + [v for v in versions if protected(v) and v not in kept]   # their manifests must stay complete
+          untagged = [v for v in versions if not v["_tags"]]
+
+
+          # ---- children of the images we keep (index -> manifests) ------------------------------------------------------------
+          b64 = base64.b64encode(os.environ["GH_TOKEN"].encode()).decode()
+          print(f"::add-mask::{b64}")
+          ACCEPT = ", ".join(["application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json",
+                              "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"])
+          by_digest = {v["name"] for v in versions}
+
+
+          def manifest_children(digest):
+              url = f"https://ghcr.io/v2/{owner}/{package}/manifests/{digest}"
+              conf = f'header = "Authorization: Bearer {b64}"\nheader = "Accept: {ACCEPT}"\n'   # via stdin: not on the command line
+              r = subprocess.run(["curl", "-fsS", "--retry", "3", "--retry-all-errors", "-K", "-", url],
+                                 input=conf, capture_output=True, text=True)
+              if r.returncode != 0:
+                  die(f"could not read the manifest {digest} from ghcr.io ({r.stderr.strip()[:200]}); nothing was deleted")
+              try:
+                  doc = json.loads(r.stdout)
+              except ValueError:
+                  die(f"manifest {digest} is not JSON; nothing was deleted")
+              return [(m["digest"], m.get("mediaType", "")) for m in doc.get("manifests", []) if isinstance(m, dict) and "digest" in m]
+
+
+          referenced, queue, seen = set(), [v["name"] for v in anchors], set()
+          depth = 0
+          while queue and depth < 3:
+              nxt = []
+              for d in queue:
+                  if d in seen:
+                      continue
+                  seen.add(d)
+                  for child, media in manifest_children(d):
+                      referenced.add(child)
+                      if "index" in media or "manifest.list" in media:   # a nested index: look inside; a plain manifest has no children
+                          nxt.append(child)
+              queue, depth = nxt, depth + 1
+
+          # ---- plan --------------------------------------------------------------------------------------------------------
+          plan = []                                    # (version, reason)
+          for v in old_tagged:
+              if protected(v):
+                  continue
+              if v["name"] in referenced:
+                  continue
+              plan.append((v, f"older than the newest {keep} sha-* versions"))
+          for v in untagged:
+              if v["_created"] < cutoff and v["name"] not in referenced:
+                  plan.append((v, f"untagged for more than {untagged_days} days and not referenced by a kept image"))
+
+          def show(v):
+              return f"id={v['id']} {v['name'][:19]} created={v['_created']:%Y-%m-%d %H:%M} tags={','.join(v['_tags']) or '-'}"
+
+          print(f"{owner}/{package}: {len(versions)} version(s): {len(kept)} kept sha-* (newest {keep}), "
+                f"{len([v for v in anchors if v not in kept])} with other tags (never deleted), {len(untagged)} untagged, "
+                f"{len(referenced & by_digest)} referenced by kept images")
+          for v in kept:
+              print(f"  KEEP    {show(v)}")
+
+          # ---- sanity: refuse rather than guess ------------------------------------------------------------------------------
+          if plan:
+              ids = {v["id"] for v, _ in plan}
+              if not kept:
+                  die("no sha-* tagged version to keep; refusing to delete anything (is the tag format still sha-<commit>?)")
+              if len(plan) >= len(versions):
+                  die("the plan would remove every version; refusing")
+              if versions[0]["id"] in ids:
+                  die("the newest version is in the delete list; refusing")
+              if any(v["id"] in ids for v in kept):
+                  die("a kept version is in the delete list; refusing")
+
+          plan.sort(key=lambda t: t[0]["_created"])    # oldest first
+          truncated = len(plan) > MAX_DELETE
+          todo = plan[:MAX_DELETE]
+          failures = 0
+          for v, reason in todo:
+              label = "WOULD DELETE" if dry_run else "DELETE"
+              print(f"  {label} {show(v)}  ({reason})")
+              if dry_run:
+                  continue
+              r = gh("api", "-X", "DELETE", f"{api}/{v['id']}", check=False)
+              if r.returncode != 0:
+                  err = (r.stderr + r.stdout)
+                  if "404" in err:
+                      continue                           # already gone
+                  failures += 1
+                  print(f"::error::delete of {v['id']} failed: {err.strip()[:300]}")
+                  if "403" in err:
+                      print("::error::403: the token needs the admin role on this package (Package settings > Manage Actions access)")
+                      break
+          if truncated:
+              print(f"::notice::{len(plan)} versions qualify; only the oldest {MAX_DELETE} are handled per run, the next run continues")
+          if not plan:
+              print("nothing to delete")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"### ghcr.io/{owner}/{package} {'(dry run)' if dry_run else ''}\n\n")
+              s.write(f"{len(versions)} versions; {len(kept)} newest sha-* kept; {len(todo)} {'would be deleted' if dry_run else 'deleted'}"
+                      f"{' (limit reached, the next run continues)' if truncated else ''}.\n\n")
+              if todo:
+                  s.write("| Version | Digest | Created | Tags | Reason |\n|---|---|---|---|---|\n")
+                  for v, reason in todo:
+                      s.write(f"| {v['id']} | `{v['name'][:19]}` | {v['_created']:%Y-%m-%d} | {','.join(v['_tags']) or '-'} | {reason} |\n")
+          sys.exit(1 if failures else 0)
+          PY

@@ -1,0 +1,443 @@
+name: Scheduled code scan
+
+# Weekly dependency (SCA) and static-analysis (SAST) scan of the DEFAULT BRANCH of every code repository, with the same tools and versions
+# as the language pipelines (go-ci, node-ci, python-ci, java-gradle-ci, dotnet-ci): a vulnerability published after the last pull
+# request is found here, not at the next unrelated change. This workflow is NOT reusable: it has its own schedule and runs in this repository.
+#
+# Reading the other repositories: they are all PUBLIC, so `actions/checkout` with `repository:` needs no extra secret. It uses this run's
+# GITHUB_TOKEN, which is scoped to THIS repository (contents: read) and cannot see anything private; the other repositories are read
+# anonymously, in effect. Nothing is written to them. If a scanned repository ever becomes private, its checkout fails (the run goes
+# red and the report says so) and a read-only token has to be added on purpose. Credentials are not persisted into the checkouts.
+#
+# Findings: one issue "Scheduled code scan" (label security-scan) in THIS repository, created or updated in place and closed when clean,
+# plus the job summary. The run itself stays green on findings (a red scheduled run emails whoever last edited the cron line and stays
+# red until fixed); it is red when a repository could not be scanned at all. Manual runs can set `fail-on-findings`.
+#
+# Free-plan limits: `max-parallel` caps the concurrent jobs (the plan allows 20 in total, shared with the image scan and normal CI).
+# Scheduled workflows of a public repository are disabled by GitHub after 60 days without repository activity; see the keepalive job.
+# The tool versions below are the defaults of the language workflows: bump them together.
+
+on:
+  schedule:
+    - cron: '0 8 * * 1' # every Monday 08:00 UTC (GitHub may delay it under load)
+  workflow_dispatch:
+    inputs:
+      only:
+        description: Scan only these repositories (comma separated names, e.g. app-checkout-service,app-frontend); empty = all
+        type: string
+        default: ""
+      fail-on-findings:
+        description: Make the run red when there are findings
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: scheduled-code-scan
+  cancel-in-progress: false
+
+env:
+  ORG: platform-boutique
+  TRIVY_VERSION: v0.76.1
+  SEMGREP_VERSION: 1.180.0
+  GOVULNCHECK_VERSION: v1.9.0
+  GOSEC_VERSION: v2.29.0
+  PIP_AUDIT_VERSION: 2.10.1
+  BANDIT_VERSION: 1.9.4
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      # The repositories and what each needs (the same paths the callers pass to the language workflows). Edit this list when a repository
+      # is added. language: go | node | python | java | dotnet | yarn (Backstage portal and plugins: yarn.lock via Trivy, no build).
+      - name: Repository list
+        id: plan
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+
+          NODE = "p/typescript p/nodejs p/secrets"
+          repos = [
+              {"repo": "app-ad-service",             "language": "java",   "semgrep": "p/java p/owasp-top-ten"},
+              {"repo": "app-cart-service",           "language": "dotnet", "semgrep": "p/csharp p/owasp-top-ten", "project": "src/cartservice.csproj"},
+              {"repo": "app-checkout-service",       "language": "go"},
+              {"repo": "app-currency-service",       "language": "node",   "semgrep": NODE},
+              {"repo": "app-email-service",          "language": "python"},
+              {"repo": "app-frontend",               "language": "go"},
+              {"repo": "app-payment-service",        "language": "node",   "semgrep": NODE},
+              {"repo": "app-product-catalog-service", "language": "go"},
+              {"repo": "app-recommendation-service", "language": "python"},
+              {"repo": "app-shipping-service",       "language": "go"},
+              {"repo": "platform-demo-backstage",                  "language": "yarn", "semgrep": NODE},
+              {"repo": "platform-demo-backstage-plugin-argocd",    "language": "yarn", "semgrep": NODE},
+              {"repo": "platform-demo-backstage-plugin-hubble",    "language": "yarn", "semgrep": NODE},
+              {"repo": "platform-demo-backstage-plugin-policies",  "language": "yarn", "semgrep": NODE},
+              {"repo": "platform-demo-backstage-plugin-releases",  "language": "yarn", "semgrep": NODE},
+          ]
+          only = {x.strip() for x in os.environ.get("ONLY", "").split(",") if x.strip()}
+          if only:
+              unknown = only - {r["repo"] for r in repos}
+              if unknown:
+                  raise SystemExit(f"::error::unknown repositor{'y' if len(unknown) == 1 else 'ies'}: {', '.join(sorted(unknown))}")
+              repos = [r for r in repos if r["repo"] in only]
+          for r in repos:
+              r.setdefault("semgrep", "")
+              r.setdefault("project", "")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"matrix={json.dumps({'include': repos}, separators=(',', ':'))}\n")
+              out.write(f"count={len(repos)}\n")
+          print(f"{len(repos)} repositories")
+          PY
+
+  scan:
+    name: Scan ${{ matrix.repo }}
+    needs: [plan]
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # this repository only; the scanned repositories are public
+    strategy:
+      fail-fast: false # one broken repository must not hide the others
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      REPO: ${{ matrix.repo }}
+      LANGUAGE: ${{ matrix.language }}
+      SEMGREP_CONFIG: ${{ matrix.semgrep }}
+      PROJECT: ${{ matrix.project }}
+    steps:
+      - name: Check out ${{ matrix.repo }} (default branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.ORG }}/${{ matrix.repo }}
+          path: target
+          persist-credentials: false
+
+      # Runs one tool inside the repository and records pass / fail with an excerpt of the output; never fails the step, the report does the judging.
+      - name: Prepare the result recorder
+        run: |
+          mkdir -p "$RUNNER_TEMP/results" "$RUNNER_TEMP/bin"
+          cat > "$RUNNER_TEMP/bin/run-check" <<'SH'
+          #!/usr/bin/env bash
+          # usage: run-check <sca|sast> <tool> <command...>      (cwd = the repository)
+          kind=$1; tool=$2; shift 2
+          log="$RUNNER_TEMP/results/${kind}.log"
+          echo "::group::${kind}: ${tool}"
+          set +e
+          NO_COLOR=1 "$@" 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "::endgroup::"
+          lines=$(wc -l < "$log")
+          if [ "$lines" -gt 70 ]; then
+            excerpt="$(head -n 45 "$log"; echo "[... $((lines - 65)) lines omitted, see the run log ...]"; tail -n 20 "$log")"
+          else
+            excerpt="$(cat "$log")"
+          fi
+          status=pass; [ "$rc" -eq 0 ] || status=fail
+          jq -n --arg repo "$REPO" --arg kind "$kind" --arg tool "$tool" --arg status "$status" --argjson rc "$rc" \
+            --arg excerpt "${excerpt:0:6000}" \
+            '{repo: $repo, kind: $kind, tool: $tool, status: $status, rc: $rc, excerpt: $excerpt}' > "$RUNNER_TEMP/results/${kind}.json"
+          echo "${tool}: ${status} (exit ${rc})"
+          SH
+          chmod +x "$RUNNER_TEMP/bin/run-check"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      # ─── Semgrep (everything except Go and Python, like the language workflows) ───
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: matrix.language == 'python'
+        with:
+          python-version-file: target/.python-version
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: matrix.semgrep != ''
+        with:
+          python-version: "3.13"
+
+      - name: SAST - Semgrep
+        if: matrix.semgrep != ''
+        working-directory: target
+        run: |
+          pip install "semgrep==${SEMGREP_VERSION}"
+          read -ra rules <<< "$SEMGREP_CONFIG"
+          args=()
+          for rule in "${rules[@]}"; do
+            args+=(--config "$rule")
+          done
+          # .yarn holds the vendored Yarn release of the Backstage repositories (minified, not ours)
+          [ "$LANGUAGE" != yarn ] || args+=(--exclude .yarn)
+          run-check sast semgrep semgrep scan "${args[@]}" --error --metrics=off
+
+      # ─── Go: govulncheck + gosec ───
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: matrix.language == 'go'
+        with:
+          go-version-file: target/go.mod
+          cache: false
+
+      - name: SCA and SAST - govulncheck, gosec
+        if: matrix.language == 'go'
+        working-directory: target
+        run: |
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          go install "github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}"
+          go mod download
+          gopath=$(go env GOPATH)
+          export PATH="${gopath}/bin:$PATH"
+          run-check sca govulncheck govulncheck ./...
+          run-check sast gosec gosec -exclude-generated ./...
+
+      # ─── Node: npm audit (Semgrep above) ───
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: matrix.language == 'node'
+        with:
+          node-version-file: target/.nvmrc
+
+      - name: SCA - npm audit
+        if: matrix.language == 'node'
+        working-directory: target
+        run: |
+          npm ci
+          run-check sca "npm audit" npm audit --audit-level=high --omit=dev
+
+      # ─── Python: pip-audit + bandit ───
+      - name: SCA and SAST - pip-audit, bandit
+        if: matrix.language == 'python'
+        working-directory: target
+        run: |
+          pip install "pip-audit==${PIP_AUDIT_VERSION}" "bandit==${BANDIT_VERSION}"
+          run-check sca pip-audit pip-audit -r requirements.txt
+          run-check sast bandit bandit -r src/ -c pyproject.toml
+
+      # ─── Java and the Backstage repositories: Trivy on the files (Semgrep above) ───
+      - name: Install Trivy
+        if: matrix.language == 'java' || matrix.language == 'yarn'
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+
+      - name: SCA - Trivy filesystem scan
+        if: matrix.language == 'java' || matrix.language == 'yarn'
+        working-directory: target
+        run: |
+          args=(fs --scanners vuln --severity "CRITICAL,HIGH" --exit-code 1 --quiet)
+          # the portal keeps its accepted findings (with an expiry date) next to the code
+          [ ! -f .trivyignore.yaml ] || args+=(--ignorefile .trivyignore.yaml)
+          run-check sca trivy trivy "${args[@]}" .
+
+      # ─── .NET: vulnerable-package audit (Semgrep above) ───
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        if: matrix.language == 'dotnet'
+        with:
+          dotnet-version-file: target/global.json
+
+      - name: SCA - dotnet vulnerable packages
+        if: matrix.language == 'dotnet'
+        working-directory: target
+        run: |
+          dotnet restore "$PROJECT"
+          # same rule as dotnet-ci: the report text says whether anything is vulnerable
+          cat > "$RUNNER_TEMP/dotnet-audit.sh" <<'SH'
+          dotnet list "$PROJECT" package --vulnerable --include-transitive 2>&1 | tee "$RUNNER_TEMP/vuln-report.txt"
+          ! grep -q "has the following vulnerable packages" "$RUNNER_TEMP/vuln-report.txt"
+          SH
+          run-check sca "dotnet list package" bash "$RUNNER_TEMP/dotnet-audit.sh"
+
+      - name: Keep the results for the report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: code-scan-${{ matrix.repo }}
+          path: ${{ runner.temp }}/results/*.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Fail when no tool ran
+        run: |
+          ls "$RUNNER_TEMP"/results/*.json > /dev/null 2>&1 || { echo "::error::no scan result was recorded for $REPO"; exit 1; }
+
+  report:
+    name: Report (summary and issue)
+    needs: [plan, scan]
+    # also when a scan job failed: the issue must show the gap
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ISSUE_TITLE: Scheduled code scan
+      PLAN: ${{ needs.plan.outputs.matrix }}
+      FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+      PARTIAL: ${{ inputs.only != '' }}
+    steps:
+      - name: Download the scan results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: code-scan-*
+          path: artifacts
+
+      - name: Build the report and update the issue
+        id: report
+        run: |
+          cat > "$RUNNER_TEMP/report.py" <<'PY'
+          import glob, hashlib, json, os, re, subprocess, sys
+          from datetime import datetime, timezone
+
+          TITLE = os.environ["ISSUE_TITLE"]
+          LABEL = "security-scan"
+          MAX_BODY = 60000
+          plan = json.loads(os.environ["PLAN"])["include"]
+          partial = os.environ.get("PARTIAL") == "true"      # a manual run of some repositories only: never closes the issue
+          ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+          IDS = re.compile(r"GO-\d{4}-\d+|CVE-\d{4}-\d+|GHSA(?:-[a-z0-9]{4}){3}|PYSEC-\d+-\d+|\bB\d{3}\b|(?<=❯❱ )\S+|^[@\w/.-]+\s+[<>]=?\s*[\w.-]+$", re.M)
+
+          results = {}
+          for path in glob.glob("artifacts/*/*.json"):
+              r = json.load(open(path))
+              results[(r["repo"], r["kind"])] = r
+
+          run_url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          org = os.environ.get("ORG", "")
+
+          KINDS = ("sca", "sast")          # every language has both
+
+          rows, details, fingerprint, missing, failed = [], [], [], [], []
+          for item in plan:
+              repo, cells = item["repo"], []
+              got = 0
+              for kind in KINDS:
+                  r = results.get((repo, kind))
+                  if r is None:
+                      cells.append("not run")
+                      fingerprint.append(f"{repo}|{kind}|missing")
+                      continue
+                  got += 1
+                  if r["status"] == "pass":
+                      cells.append(f"pass ({r['tool']})")
+                  else:
+                      cells.append(f"**FAIL** ({r['tool']})")
+                      ids = sorted(set(m.group(0).strip() for m in IDS.finditer(ANSI.sub("", r["excerpt"]))))
+                      fingerprint.append(f"{repo}|{kind}|fail|{'/'.join(ids)}")
+                      failed.append((repo, r))
+              if got == 0:
+                  missing.append(repo)
+              rows.append(f"| [{repo}](https://github.com/{org}/{repo}) | {item['language']} | {cells[0]} | {cells[1]} |")
+
+          for repo, r in failed:
+              text = ANSI.sub("", r["excerpt"]).strip()
+              details.append(f"<details><summary><b>{repo}</b>: {r['kind'].upper()} {r['tool']} (exit {r['rc']})</summary>\n\n```\n{text[:2800]}\n```\n\n</details>\n")
+
+          fp = hashlib.sha256("\n".join(sorted(fingerprint)).encode()).hexdigest()[:16]
+          problem = bool(fingerprint)
+          n_fail = len(failed)
+          summary = f"{n_fail} failing check(s), {len(missing)} repositor{'y' if len(missing) == 1 else 'ies'} not scanned"
+
+          table = ["| Repository | Language | SCA | SAST |", "|---|---|---|---|"] + rows
+          body_parts = [f"Last run: {now} ([run]({run_url})). Default branch of each repository, same tools and versions as the language "
+                        "workflows (SCA: govulncheck, npm audit, pip-audit, Trivy, dotnet; SAST: gosec, Semgrep, bandit).", ""] + table + [""]
+          if missing:
+              body_parts += ["**Not scanned** (checkout or setup failed, the run is red): " + ", ".join(f"`{m}`" for m in missing), ""]
+          body_parts += details
+          body = "\n".join(body_parts)
+          if len(body) > MAX_BODY - 200:
+              body = body[: MAX_BODY - 400] + "\n\n... (shortened, see the run log)\n"
+          body += f"\n<!-- scan-fingerprint:{fp} -->\n"
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write("## Scheduled code scan\n\n" + "\n".join(table) + "\n\n")
+              if missing:
+                  s.write("**Not scanned:** " + ", ".join(missing) + "\n\n")
+              s.write("\n".join(details) + f"\nResult: {summary}.\n")
+
+
+          def gh(*args, check=True):
+              p = subprocess.run(["gh", *args], capture_output=True, text=True)
+              if check and p.returncode != 0:
+                  sys.exit(f"gh {' '.join(args[:3])} failed: {p.stderr.strip()}")
+              return p.stdout
+
+
+          listing = json.loads(gh("issue", "list", "--state", "all", "--label", LABEL, "--limit", "100",
+                                  "--json", "number,title,state,body") or "[]")
+          mine = [i for i in listing if i["title"] == TITLE]
+          mine.sort(key=lambda i: (i["state"] != "OPEN", -i["number"]))   # an open one first, else the newest closed one
+          issue = mine[0] if mine else None
+          old_fp = None
+          if issue:
+              m = re.search(r"<!-- scan-fingerprint:([0-9a-f]+) -->", issue["body"] or "")
+              old_fp = m.group(1) if m else None
+
+          if os.environ.get("DRY_RUN") == "true":
+              print("DRY RUN", json.dumps({"issue": issue and issue["number"], "problem": problem, "fp": fp, "old_fp": old_fp}))
+              print(body)
+          elif problem:
+              gh("label", "create", LABEL, "--color", "D93F0B", "--description", "Findings of the scheduled security scans", "--force", check=False)
+              with open("body.md", "w") as f:
+                  f.write(body)
+              if issue is None:
+                  print("created", gh("issue", "create", "--title", TITLE, "--label", LABEL, "--body-file", "body.md").strip())
+              else:
+                  num = str(issue["number"])
+                  if partial and issue["state"] == "OPEN":
+                      print("partial manual run: the open issue is left as it is")
+                  else:
+                      gh("issue", "edit", num, "--body-file", "body.md")
+                      if issue["state"] != "OPEN":
+                          gh("issue", "reopen", num, "--comment", f"Reopened by the scan of {now}: {summary}. [Run]({run_url})")
+                      elif old_fp != fp:
+                          gh("issue", "comment", num, "--body", f"The findings changed in the scan of {now}: {summary}. [Run]({run_url})")
+                      print(f"updated #{num}")
+          elif issue is not None and issue["state"] == "OPEN" and not partial:
+              num = str(issue["number"])
+              with open("body.md", "w") as f:
+                  f.write(body)
+              gh("issue", "edit", num, "--body-file", "body.md")
+              gh("issue", "close", num, "--reason", "completed", "--comment", f"Clean in the scan of {now}: all checks passed. [Run]({run_url})")
+              print(f"closed #{num}")
+          else:
+              print("clean (or a partial run), nothing to change")
+
+          with open(os.environ.get("GITHUB_OUTPUT", os.devnull), "a") as f:
+              f.write(f"problem={'true' if problem else 'false'}\n")
+          PY
+          python3 "$RUNNER_TEMP/report.py"
+
+      - name: Fail on findings (only when asked for)
+        if: steps.report.outputs.problem == 'true' && env.FAIL_ON_FINDINGS == 'true'
+        run: |
+          echo "::error::the scan has findings (fail-on-findings is set); see the issue and the job summary"
+          exit 1
+
+  # GitHub switches scheduled workflows of a public repository off after 60 days without repository activity. Enabling the workflow
+  # through the API every week is a no-op that (reportedly; GitHub does not promise it) restarts that clock. If it stops working, the
+  # repository owner gets GitHub's "scheduled workflow disabled" email and re-enables it in the Actions tab.
+  keepalive:
+    name: Keep the schedule enabled
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Enable this workflow (no-op when it is enabled)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow enable scheduled-code-scan.yaml
