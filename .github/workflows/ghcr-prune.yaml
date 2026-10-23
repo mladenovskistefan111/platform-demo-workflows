@@ -48,6 +48,8 @@ jobs:
     name: Prune ${{ inputs.package }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # a failed prune must never fail a publish (the caller cannot set continue-on-error on a `uses:` job)
+    continue-on-error: true
     permissions:
       packages: write
       contents: read
