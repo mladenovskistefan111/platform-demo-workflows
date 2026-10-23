@@ -7,11 +7,16 @@ Why generated: the Actions graph of a caller shows every job of the called workf
 therefore drew four hollow language boxes and nested boxes inside boxes. These files are FLAT (no nested `uses:` of other workflows)
 and contain only what the repository really runs:
 
-    Guard: Changes | Guard: Secrets | Guard: Workflows      no needs: start at t=0, together
-    Check: Lint | Check: Build | Check: Tests               need only `Guard: Changes` (skipped for a docs-only change), run in
-    Security: SCA | Security: SAST | Image: Build + CVE scan  parallel with the other two guards (the image is pushed as
-                                                                ghcr.io/<repo>:tree-<hash> by runs that may; see wfgen.py)
-    gate                                                     needs EVERY job, always runs
+    Detect changes | Secret scan | Workflow lint      no needs: start at t=0, together
+    Lint | Build | Tests                              need only `Detect changes` (skipped for a docs-only change), run in
+    Dependency scan | Code scan | Image build and scan   parallel with the other two (the image is pushed as
+                                                         ghcr.io/<repo>:tree-<hash> by runs that may; see wfgen.py)
+    gate                                              needs EVERY job, always runs
+
+Job names: sentence case, what the job does, no group prefixes; the caller's job id is the prefix GitHub shows (`ci / Build`), and the
+required check stays `ci / gate`. The gate keys on JOB IDS (the keys of `needs`), never on names; it only shows the names.
+Run summaries (GITHUB_STEP_SUMMARY, one section per job on the run page): `Detect changes` writes what changed (changed-paths.yaml),
+`Image build and scan` the image (tools/wfgen.py), `gate` the verdict, the results and what the Merge button will do.
 
 The left column means "starts at t=0", not "must pass first": a flaky gitleaks download or one lint complaint does not hide the
 test, SAST and Trivy results (one round trip instead of two). The gate fails if any of them failed.
@@ -83,10 +88,12 @@ COMMON_INPUTS = """\
 """
 
 GUARDS = ["changes", "secret-scan", "workflow-lint"]
+# Job names: sentence case, what the job does, no group prefixes (the caller's job id is the prefix GitHub shows: `ci / Build`).
+# Language detail belongs in the step names. The same names in all six files (tools/check-consistency.py pins them).
 NAMES = {
-    "changes": "Guard: Changes", "secret-scan": "Guard: Secrets", "workflow-lint": "Guard: Workflows",
-    "lint": "Check: Lint", "build": "Check: Build", "test": "Check: Tests",
-    "sca": "Security: SCA", "sast": "Security: SAST", "image": "Image: Build + CVE scan", "gate": "gate",
+    "changes": "Detect changes", "secret-scan": "Secret scan", "workflow-lint": "Workflow lint",
+    "lint": "Lint", "build": "Build", "test": "Tests",
+    "sca": "Dependency scan", "sast": "Code scan", "image": "Image build and scan", "gate": "gate",
 }
 CHECKS = {l: ["lint", "build", "test", "sca", "sast", "image"] for l in LANGS if l != "none"}
 CHECKS["none"] = ["image"]
@@ -211,6 +218,7 @@ def image_steps():
         wfgen.record_step("${{ steps.mode.outputs.push }}"),
         wfgen.trivy_step("${{ steps.image.outputs.ref }}",
                          "same version, threshold and ignore file as the scan in service-publish.yaml (which scans the same digest again)"),
+        wfgen.summary_step(scan=True),
     ]
 
 
@@ -223,34 +231,59 @@ def image_job():
 
 # The gate. Same contract as before: the only required check. Strict about what must have succeeded, lenient about nothing else.
 GATE_SCRIPT = r"""
-# Jobs this workflow has: the three guards and the checks (generated per language). NEEDS holds the result of every one of them.
+# Jobs this workflow has, in the order of the graph: the three guards, then the checks (generated per language), and their names.
 guards=" __GUARDS__ "
 checks=" __CHECKS__ "
+declare -A names=(__NAMES__)
+
+# Text that does not come from this script (an unknown job id, a result) is shown with letters, digits and . _ - only.
+safe() { printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '?' | cut -c1-60; }
+label() { echo "${names[$1]:-$(safe "$1")}"; }
+words() {
+  case "$1" in
+    success) echo passed ;;
+    failure) echo failed ;;
+    cancelled) echo cancelled ;;
+    skipped) echo skipped ;;
+    *) safe "$1" ;;
+  esac
+}
+
+stop() { # stop <message for the log> <heading for the summary>: nothing can be judged
+  echo "::error::$1"
+  echo "### Blocked: $2" >> "$GITHUB_STEP_SUMMARY"
+  exit 1
+}
 
 case "$IMAGE" in
   true | false) ;;
-  *) echo "::error::input image is '$IMAGE', expected true or false"; exit 1 ;;
+  *) stop "input image is '$IMAGE', expected true or false" "the input image is neither true nor false" ;;
 esac
 
+declare -A result
+unknown=()
 mapfile -t rows < <(jq -r 'to_entries[] | [.key, .value.result] | @tsv' <<< "$NEEDS")
+for row in "${rows[@]}"; do
+  IFS=$'\t' read -r job res <<< "$row"
+  result[$job]=$res
+  [ -n "${names[$job]+x}" ] || unknown+=("$job")
+done
 for job in $guards $checks; do
-  jq -e --arg job "$job" 'has($job)' <<< "$NEEDS" > /dev/null || { echo "::error::job $job is missing from needs"; exit 1; }
+  [ -n "${result[$job]+x}" ] || stop "job $job is missing from needs" "$(label "$job") is missing from the results the gate received"
 done
 
 # 1. The cause first: a job that failed or was cancelled. Everything downstream of a failed guard is skipped by GitHub, and
 #    that skip is a consequence, not a finding, so it is not reported as one.
 failed=0
 unexplained=0
-{
-  echo "### Gate (code changed: ${CODE:-unknown}, image: $IMAGE)"
-} >> "$GITHUB_STEP_SUMMARY"
-for row in "${rows[@]}"; do
-  IFS=$'\t' read -r job result <<< "$row"
-  case "$result" in
+bad_code=0
+causes=()
+for job in $guards $checks "${unknown[@]}"; do
+  case "${result[$job]}" in
     failure | cancelled)
       failed=1
-      echo "::error::$job $result"
-      echo "- **$job $result**" >> "$GITHUB_STEP_SUMMARY"
+      echo "::error::$job ${result[$job]}"
+      causes+=("$job")
       ;;
   esac
 done
@@ -265,31 +298,89 @@ done
 if [ "$failed" = 0 ] && [ "$CODE" != "true" ] && [ "$CODE" != "false" ]; then
   echo "::error::change detection gave '$CODE', expected true or false"
   failed=1
+  bad_code=1
+fi
+
+table=""
+first_unexplained=""
+for job in $guards $checks "${unknown[@]}"; do
+  res=${result[$job]}
+  expected=${want[$job]:-}
+  shown_expected=${expected:-(unknown job)}
+  printf '%-14s %-10s (expected %s)\n' "$job" "$res" "$shown_expected"
+  if [ -z "$expected" ]; then
+    cell="$(words "$res") (unknown job)"
+  elif [ "$res" = "$expected" ]; then
+    cell=$(words "$res")
+    if [ "$res" = skipped ]; then
+      if [ "$CODE" = "false" ]; then cell="skipped: documentation only"; else cell="skipped: no image pipeline"; fi
+    fi
+  elif [ "$failed" = 1 ]; then
+    cell=$(words "$res")
+  else
+    cell="$(words "$res"), expected $(words "$expected")"
+  fi
+  table+="| $(label "$job") | $cell |"$'\n'
+  # Only when nothing failed: otherwise the failure above is the cause and skipped jobs downstream of it are expected.
+  if [ "$failed" = 0 ] && [ "$res" != "$expected" ]; then
+    echo "::error::$job is '$res', expected '$shown_expected'"
+    unexplained=1
+    [ -n "$first_unexplained" ] || first_unexplained=$job
+  fi
+done
+
+# 3. The summary: the verdict first, then what changed, the results, and what the Merge button will do.
+blocked=1
+if [ "${#causes[@]}" -gt 0 ]; then
+  verdict="Blocked: $(label "${causes[0]}") $(words "${result[${causes[0]}]}")"
+  [ "${#causes[@]}" -eq 1 ] || verdict+=" (and $((${#causes[@]} - 1)) more)"
+elif [ "$bad_code" = 1 ]; then
+  verdict="Blocked: change detection gave no valid answer"
+elif [ "$unexplained" = 1 ]; then
+  verdict="Blocked: $(label "$first_unexplained") ended as $(words "${result[$first_unexplained]}"), which was not expected"
+elif [ "$EVENT" = pull_request ]; then
+  verdict="Ready to merge"
+  blocked=0
+else
+  verdict="All checks passed"
+  blocked=0
 fi
 
 {
+  echo "### $verdict"
   echo
-  echo "| job | result | expected |"
-  echo "|---|---|---|"
-} >> "$GITHUB_STEP_SUMMARY"
-for row in "${rows[@]}"; do
-  IFS=$'\t' read -r job result <<< "$row"
-  expected=${want[$job]:-}
-  if [ -z "$expected" ]; then expected="(unknown job)"; fi
-  printf '%-14s %-10s (expected %s)\n' "$job" "$result" "$expected"
-  echo "| $job | $result | $expected |" >> "$GITHUB_STEP_SUMMARY"
-  # Only when nothing failed: otherwise the failure above is the cause and skipped jobs downstream of it are expected.
-  if [ "$failed" = 0 ] && [ "$result" != "$expected" ]; then
-    echo "::error::$job is '$result', expected '$expected'"
-    unexplained=1
+  case "$CODE" in
+    true) echo "Change: **code**. All checks apply."; echo ;;
+    false) echo "Change: **documentation only**. Tests, scans and the image build were skipped."; echo ;;
+  esac
+  echo "| Job | Result |"
+  echo "|---|---|"
+  printf '%s' "$table"
+  if [ "$EVENT" = pull_request ]; then
+    echo
+    if [ "$blocked" = 1 ]; then
+      echo "Merging is blocked: \`ci / gate\` is the required check. The \`merge\` job does not run after a failed run."
+    elif [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ] && [ "$ACTOR" != 'dependabot[bot]' ]; then
+      publish=""
+      [ "$IMAGE" != true ] || publish=" and start Publish"
+      echo "**Merge button:** approve the \`merge\` environment on this run page (Review deployments) to squash-merge this pull request${publish}."
+      if [ "$IMAGE" = true ] && [ "$CODE" = false ]; then
+        echo "Publish will find only documentation and publish nothing."
+      fi
+    else
+      echo "The \`merge\` job does not run for fork or Dependabot pull requests: use the Merge button on the pull request."
+      if [ "$IMAGE" = true ]; then echo "Publish starts from the push to \`main\`."; fi
+    fi
   fi
-done
+} >> "$GITHUB_STEP_SUMMARY"
 exit $((failed + unexplained))
 """
 
 
 def gate_job(lang):
-    script = GATE_SCRIPT.replace("__GUARDS__", " ".join(GUARDS)).replace("__CHECKS__", " ".join(CHECKS[lang]))
+    names = " ".join(f'[{k}]="{NAMES[k]}"' for k in GUARDS + CHECKS[lang])
+    script = (GATE_SCRIPT.replace("__GUARDS__", " ".join(GUARDS)).replace("__CHECKS__", " ".join(CHECKS[lang]))
+              .replace("__NAMES__", names))
     body = "\n".join(("          " + l) if l else "" for l in script.strip("\n").split("\n"))
     needs = GUARDS + CHECKS[lang]
     step = (
@@ -298,6 +389,9 @@ def gate_job(lang):
         "          NEEDS: ${{ toJSON(needs) }}\n"
         "          IMAGE: ${{ inputs.image }}\n"
         "          CODE: ${{ needs.changes.outputs.code }}\n"
+        "          EVENT: ${{ github.event_name }}\n"
+        "          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}\n"
+        "          ACTOR: ${{ github.actor }}\n"
         "        run: |\n" + body)
     return render_job("gate", [step], timeout=5, perms="    permissions: {}", needs=needs, cond="${{ always() }}")
 
@@ -323,11 +417,11 @@ name: Service CI ({title})
 # GENERATED by tools/gen-service-ci.py - do not edit; change the stand-alone workflow or the generator and run the generator.
 #
 # The pull-request pipeline of {who}, flat: every job is in this file and nothing is called from here, so the Actions graph shows
-# exactly what runs, left to right, with short names (`ci / Check: Build`):
+# exactly what runs, left to right, with plain names (`ci / Build`):
 #
 #   {s1}   (no needs: start at t=0)
 #   {s2}
-#            (need only `Guard: Changes`; a docs-only change skips them, the guards still run)
+#            (need only `Detect changes`; a docs-only change skips them, the guards still run)
 #   gate     (needs every job, always runs, names the job that failed first)
 #
 # The left column means "starts at t=0", not "must pass first": a failed guard does not hide the results of the checks.
@@ -357,10 +451,10 @@ def render(lang):
         notes = ("# `image: false` (product-catalog-db) leaves only the guards and the gate; the image job is then skipped. With the image\n"
                  "# left on this suits a repository whose tests are their own jobs (the developer portal).\n")
     elif lang in ("go", "node"):
-        notes = ("# The optional smoke test (input smoke-port) is a step of Check: Build and the E2E tests (input e2e-packages, go) a step of\n"
-                 "# Check: Tests: no extra jobs, and the smoke test reuses the build.\n" if lang == "go" else
-                 "# The optional smoke test (input smoke-port) is a step of Check: Build: no extra job, and it reuses the build.\n")
-    grant = "contents: read, packages: read" + (" and checks: write (the test reporter)" if lang == "dotnet" else "")
+        notes = ("# The optional smoke test (input smoke-port) is a step of Build and the E2E tests (input e2e-packages, go) a step of\n"
+                 "# Tests: no extra jobs, and the smoke test reuses the build.\n" if lang == "go" else
+                 "# The optional smoke test (input smoke-port) is a step of Build: no extra job, and it reuses the build.\n")
+    grant = "contents: read and packages: write (the image job pushes the tree image)" + (" and checks: write (the test reporter)" if lang == "dotnet" else "")
     head = HEADER.format(title=TITLE[lang], who=who, s1=s1, s2=s2, notes=notes, file=file, grant=grant, inputs=inputs_block(lang))
     jobs = guard_jobs() + (lang_jobs(lang) if lang != "none" else []) + [image_job(), gate_job(lang)]
     text = head + "\n".join(jobs)

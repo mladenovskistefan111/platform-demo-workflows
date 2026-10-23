@@ -10,6 +10,7 @@ jq, python3 and PyYAML.  usage: tools/test-shell.py [repo-dir]      exit 1 and o
   * prune selection (sha-* and tree-* families, protected tags, image-index children) with fake package JSON
   * service-merge.yaml, the merge button (approval check, branch-moved check, merge, `before`, starting Publish) with a stubbed gh, and
     the short caller job that calls it
+  * the run summaries: what changed (file list capped, hostile file names), the image section, the published section, scan, SBOM, prune
   * the release tag button (version check, existing tag, annotated tag on the commit)
 """
 import hashlib, json, os, shutil, stat, subprocess, sys, tempfile, textwrap
@@ -245,8 +246,7 @@ for name, env_, rc_want, want in (
     rc, out = e.run(REC, {"GITHUB_REPOSITORY": "O/R", "TREE": "t" * 40, **env_})
     o = e.outputs()
     check(f"record: {name}", (rc == 0) == (rc_want == 0) and all(o.get(k) == v for k, v in want.items()), f"rc={rc} {o} {out}")
-    if rc_want == 0:
-        check(f"record: {name}: summary names the tree", "t" * 40 in parse_summary(e))
+    check(f"record: {name}: the record step writes outputs only (the summary is the last step)", parse_summary(e) == "")
     e.done()
 
 # ───────────────────────── Copy to Docker Hub ─────────────────────────
@@ -661,6 +661,177 @@ check("release: runs only on main, needs only contents: write, no environment ap
       and rel["permissions"] == {"contents": "write"} and "environment" not in rel)
 shutil.rmtree(origin, ignore_errors=True)
 shutil.rmtree(work, ignore_errors=True)
+
+# ───────────────────────── Run summaries ─────────────────────────
+SERVER = "https://github.com"
+MAX_SUMMARY = 1024 * 1024  # GitHub rejects a step summary over 1 MiB
+
+# ---- Detect changes: "What changed" (pull request, from the flat service-ci workflow; and the publish flavour) ----
+CI_CHG = step(ci_files["go"]["jobs"]["changes"], "id", "diff")["run"]
+
+
+def pr_repo(base_files, pr_files, main_moved=True):
+    """A repository with a real merge commit (HEAD = main + the pull request), like the checkout of a pull_request run."""
+    repo = tempfile.mkdtemp(prefix="test-repo-")
+    git(repo, "init", "-q", "-b", "main")
+    commit(repo, base_files, "base")
+    git(repo, "checkout", "-q", "-b", "pr")
+    commit(repo, pr_files, "the pull request")
+    git(repo, "checkout", "-q", "main")
+    if main_moved:
+        commit(repo, {"unrelated.txt": "x\n"}, "main moved")
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge", "pr")
+    return repo
+
+
+def what_changed(script, event, repo, before=""):
+    e = Env()
+    rc, out = e.run(script, {"EVENT_NAME": event, "BEFORE_SHA": before}, cwd=repo)
+    summ = parse_summary(e)
+    o = e.outputs()
+    e.done()
+    return rc, out, summ, o
+
+
+repo = pr_repo({"main.go": "package main\n"}, {"README.md": "# x\n", "docs/a.md": "a\n"})
+rc, out, summ, o = what_changed(CI_CHG, "pull_request", repo)
+check("summary: docs-only pull request: verdict, count, list",
+      rc == 0 and o.get("code") == "false" and summ.startswith("### What changed\n\n**Documentation only.** Tests, scans and the image build are skipped.\n")
+      and "\n2 changed files.\n" in summ and "<details><summary>Changed files (2)</summary>" in summ and "- `README.md`" in summ and "- `docs/a.md`" in summ
+      and "</details>" in summ and "Workflow files" not in summ, f"rc={rc} {o}\n{summ}")
+shutil.rmtree(repo, ignore_errors=True)
+
+repo = pr_repo({"main.go": "package main\n"}, {".github/workflows/ci.yaml": "name: x\n", "main.go": "package main // v2\n", "README.md": "r\n"})
+rc, out, summ, o = what_changed(CI_CHG, "pull_request", repo)
+check("summary: code pull request that touches a workflow file: names the first code file and warns about the workflow",
+      rc == 0 and o.get("code") == "true" and "**Code changed.** `.github/workflows/ci.yaml` is not documentation or metadata, so everything runs." in summ
+      and "\n3 changed files.\n" in summ and "**Workflow files are part of this change.** Approving the merge includes them: read them first." in summ,
+      f"rc={rc} {o}\n{summ}")
+rc, out, summ_push, o = what_changed(CI_CHG, "push", repo, before=git(repo, "rev-parse", "HEAD^1"))
+check("summary: the workflow warning is for pull requests only (a push has no merge to approve)", rc == 0 and "Workflow files" not in summ_push, summ_push)
+shutil.rmtree(repo, ignore_errors=True)
+
+repo = pr_repo({"main.go": "package main\n"}, {"one.md": "1\n"})
+rc, out, summ, o = what_changed(CI_CHG, "pull_request", repo)
+check("summary: one file is '1 changed file.'", "\n1 changed file.\n" in summ and "Changed files (1)" in summ, summ)
+shutil.rmtree(repo, ignore_errors=True)
+
+# hostile file names: a backtick, a newline followed by a workflow command, HTML, a pipe, non-ASCII, a very long name
+hostile = {"a`b`c.go": "1", "x\n::error::boom.go": "1", "<img src=x onerror=alert(1)>.md": "1", "t|able.md": "1", "caf\u00e9.go": "1", "n" * 230 + ".go": "1"}
+repo = pr_repo({"main.go": "package main\n"}, hostile)
+rc, out, summ, o = what_changed(CI_CHG, "pull_request", repo)
+items = [l for l in summ.splitlines() if l.startswith("- ")]
+check("summary: hostile file names stay inside their code span (one list line each, one pair of backticks, plain characters, 200 characters at most)",
+      rc == 0 and len(items) == len(hostile) and all(l.startswith("- `") and l.endswith("`") and l.count("`") == 2 and len(l) <= 206 for l in items)
+      and not any(l.startswith("boom") or l.startswith("::") for l in summ.splitlines()) and all(ord(c) < 128 for c in summ), f"rc={rc}\n{summ}")
+check("summary: a file name cannot inject a workflow command into the log", not any(l.startswith("::") for l in out.splitlines()), out)
+shutil.rmtree(repo, ignore_errors=True)
+
+# a very large pull request: the list is cut at 50, the summary stays small
+many = {f"src/f{i:04d}.go": "x" for i in range(400)}
+repo = pr_repo({"main.go": "package main\n"}, many)
+rc, out, summ, o = what_changed(CI_CHG, "pull_request", repo)
+items = [l for l in summ.splitlines() if l.startswith("- `")]
+check("summary: 400 changed files: 50 listed, '- and 350 more', well under 1 MiB",
+      rc == 0 and len(items) == 50 and "- and 350 more" in summ and "\n400 changed files.\n" in summ and len(summ) < 10000 and len(summ) < MAX_SUMMARY, f"len={len(summ)}")
+shutil.rmtree(repo, ignore_errors=True)
+
+# the cases decided before any file is listed: a reason, no list
+repo = pr_repo({"main.go": "package main\n"}, {"a.md": "1\n"})
+rc, out, summ, o = what_changed(CI_CHG, "workflow_dispatch", repo)
+check("summary: manual run: treated as code, with the reason", rc == 0 and o.get("code") == "true"
+      and "**Treated as a code change.** Reason: manual or scheduled run: everything runs." in summ and "<details>" not in summ, summ)
+shutil.rmtree(repo, ignore_errors=True)
+
+# publish flavour: a docs-only push says that nothing is published
+repo = tempfile.mkdtemp(prefix="test-repo-")
+git(repo, "init", "-q", "-b", "main")
+b0 = commit(repo, {"main.go": "package main\n"}, "code")
+commit(repo, {"docs/guide.md": "g\n"}, "docs")
+rc, out, summ, o = what_changed(CHG, "push", repo, before=b0)
+check("summary: publish, docs-only push: 'Nothing is published.'", rc == 0 and o.get("code") == "false" and "**Documentation only.** Nothing is published." in summ
+      and "Tests, scans" not in summ, summ)
+rc, out, summ, o = what_changed(CHG, "workflow_dispatch", repo, before="")
+check("summary: publish, manual run without before", "Reason: manual run without before: everything runs." in summ, summ)
+shutil.rmtree(repo, ignore_errors=True)
+
+# ---- the image section (pull-request image job and publish image job: the same step) ----
+IMG_PR = step(ci_files["go"]["jobs"]["image"], "name", "Write the image summary")
+IMG_PUB = step(pub["jobs"]["image"], "name", "Write the image summary")
+check("summary: the image section is the same script in the pull-request and the publish workflow", IMG_PR["run"] == IMG_PUB["run"])
+check("summary: the image section runs after a failure, not after a cancel", IMG_PR["if"] == IMG_PUB["if"] == "${{ !cancelled() }}")
+T = "7" * 40
+for name, env_, has, lacks in (
+        ("reused", {"HOW": "reused", "TREE": T, "DIGEST": D1}, ["### Image", "**Reused.**", f"| Tag | `tree-{T}` |", f"| Digest | `{D1}` |"], ["Trivy", "No image"]),
+        ("built", {"HOW": "built", "TREE": T, "DIGEST": D2, "SCAN": "success"}, ["**Built** and pushed", f"`{D2}`", "| Trivy scan | passed: no HIGH or CRITICAL vulnerabilities |"], ["failed"]),
+        ("scan failed", {"HOW": "built", "TREE": T, "DIGEST": D2, "SCAN": "failure"}, ["| Trivy scan | **failed**: HIGH or CRITICAL vulnerabilities", 'step "Run Trivy vulnerability scanner"'], ["passed"]),
+        ("scan did not run", {"HOW": "built", "TREE": T, "DIGEST": D2, "SCAN": "skipped"}, ["| Trivy scan | not run |"], []),
+        ("local (fork): no tag, no digest", {"HOW": "local", "TREE": T, "DIGEST": "", "SCAN": "success"}, ["**Built locally, not pushed.**", "| Trivy scan | passed"], ["| Tag", "| Digest"]),
+        ("the image step failed: nothing recorded", {"HOW": "", "TREE": T, "DIGEST": "", "SCAN": "skipped"}, ["**No image was produced.**"], ["| Tag", "| Digest"]),
+        ("the lookup failed before the tree was known", {"HOW": "", "TREE": "", "DIGEST": ""}, ["**No image was produced.**"], ["| Tag"])):
+    e = Env()
+    rc, out = e.run(IMG_PR["run"], env_)
+    summ = parse_summary(e)
+    check(f"summary: image: {name}", rc == 0 and all(x in summ for x in has) and not any(x in summ for x in lacks), f"rc={rc} {out}\n{summ}")
+    e.done()
+
+# ---- the published section ----
+SUM = step(pub["jobs"]["publish"], "name", "Write the run summary")["run"]
+pub_env = {"GITHUB_SHA": COMMIT, "GITHUB_SERVER_URL": SERVER, "GITHUB_REPOSITORY": "o/app-thing", "TREE": T, "HOW": "reused", "DIGEST": D1, "TAG": "sha-1234567",
+           "APP": "thing", "TARGET_ENV": "dev", "HELM_URL": SERVER + "/o/helm"}
+e = Env()
+rc, out = e.run(SUM, pub_env)
+summ = parse_summary(e)
+check("summary: published: tag, commit link, digest, reused tree, signature, where the dev change goes",
+      rc == 0 and summ.startswith("### Published `sha-1234567`\n") and f"| Commit | [`1234567`]({SERVER}/o/app-thing/commit/{COMMIT}) |" in summ
+      and "| Docker Hub tag | `sha-1234567` |" in summ and f"| Digest | `{D1}` |" in summ and f"reused: built by the pull request from source tree `{T}`" in summ
+      and "| Signature | verified (keyless cosign" in summ and f"[the pull request in platform-demo-helm that moves `dev` of `thing` to this digest]({SERVER}/o/helm/pulls?q=is%3Apr+head%3Apromote%2Fthing%2Fdev)" in summ,
+      f"rc={rc} {out}\n{summ}")
+e.done()
+e = Env()
+rc, out = e.run(SUM, {**pub_env, "HOW": "built"})
+check("summary: published: a build in this run says so", rc == 0 and "built in this run from source tree" in parse_summary(e), parse_summary(e))
+e.done()
+e = Env()
+rc, out = e.run(SUM, {**pub_env, "APP": "x) [evil](http://e.example) (", "TARGET_ENV": "dev"})
+summ = parse_summary(e)
+check("summary: published: an odd app name is neither printed nor made into a link", rc == 0 and "evil" not in summ and "](http" not in summ.split("| Dev change |")[1]
+      and "| Dev change | the pull request in platform-demo-helm that moves the environment to this digest |" in summ, summ)
+e.done()
+check("summary: published: no Docker Hub account name can be in it (the copy step is the only one that knows it)", "$HUB_REPO" not in SUM and "DOCKERHUB" not in SUM)
+
+# ---- scan and SBOM ----
+SCAN_SUM = step(pub["jobs"]["scan"], "name", "Write the run summary")["run"]
+for outcome, want in (("success", "Trivy found no HIGH or CRITICAL vulnerabilities in `" + D1 + "`."), ("failure", "**Trivy failed** on `" + D1 + "`"), ("skipped", "Trivy did not run.")):
+    e = Env()
+    rc, out = e.run(SCAN_SUM, {"SCAN": outcome, "DIGEST": D1})
+    check(f"summary: scan image: {outcome}", rc == 0 and want in parse_summary(e) and parse_summary(e).startswith("### Image scan\n"), parse_summary(e))
+    e.done()
+e = Env()
+rc, out = e.run(step(pub["jobs"]["sbom"], "name", "Write the run summary")["run"], {"DIGEST": D1})
+check("summary: SBOM", rc == 0 and f"An SPDX SBOM is attached to `{D1}` as a signed attestation, and the attestation was verified." in parse_summary(e), parse_summary(e))
+e.done()
+
+# ---- prune ----
+e, rc, out, deleted = prune_run(versions, manifests)
+summ = parse_summary(e)
+check("summary: prune: counts, then the deleted versions folded away",
+      rc == 0 and summ.startswith("### Clean up staging images\n\n`ghcr.io/plat-form/app-thing` had 15 versions; deleted 7, 8 remain.\n")
+      and "<summary>Versions selected for deletion (7)</summary>" in summ and summ.rstrip().endswith("</details>") and summ.count("\n| ") == 7 + 1, f"rc={rc}\n{summ}")
+e.done()
+e, rc, out, deleted = prune_run(versions, manifests, {"DRY_RUN": "true"})
+summ = parse_summary(e)
+check("summary: prune: a dry run says what it would do", "(dry run)" in summ and "would delete 7, 8 would remain" in summ and "Versions that would be deleted (7)" in summ, summ)
+e.done()
+e, rc, out, deleted = prune_run(versions, manifests, delete_fails=[2])
+summ = parse_summary(e)
+check("summary: prune: failed deletions are counted, not reported as deleted", rc != 0 and "deleted 6, 9 remain; 1 deletion(s) failed, see the log." in summ, f"rc={rc}\n{summ}")
+e.done()
+odd = [ver(1, ["sha-0000001|<b>`x"], 90), ver(2, ["sha-0000002"], 80), ver(3, ["sha-0000003"], 70), ver(4, ["tree-" + "4" * 40], 60), ver(5, ["tree-" + "5" * 40], 50)]
+e, rc, out, deleted = prune_run(odd, {v["name"]: idx([]) for v in odd}, {"KEEP": "2", "KEEP_TREE": "2"})
+summ = parse_summary(e)
+check("summary: prune: registry text in the table is reduced to plain characters", rc == 0 and deleted == [1] and "sha-0000001?" in summ and "<b>" not in summ and "`x" not in summ, f"rc={rc} {deleted}\n{summ}")
+e.done()
 
 if failures:
     print("\n\n".join(failures))

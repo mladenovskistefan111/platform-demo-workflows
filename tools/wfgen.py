@@ -217,18 +217,35 @@ fi
   echo "digest=$digest"
   echo "how=$how"
 } >> "$GITHUB_OUTPUT"
+"""
+
+# The "Image" section of the run summary: written by a last step that also runs after a failure, so the reader sees what the image
+# step did and what the scan said (Trivy fails the step on a HIGH or CRITICAL finding; the findings themselves are in its log).
+SUMMARY_SCRIPT = r"""
+set -euo pipefail
 {
   echo "### Image"
   echo
+  case "$HOW" in
+    reused) echo "**Reused.** An image of this source tree already exists, so nothing was built." ;;
+    built) echo "**Built** and pushed to the staging registry (ghcr.io)." ;;
+    local) echo "**Built locally, not pushed.** This run cannot push (a fork or Dependabot pull request), so nothing is reused or published from it." ;;
+    *) echo "**No image was produced.** See the failed step in the log." ;;
+  esac
+  echo
   echo "| | |"
   echo "|---|---|"
-  echo "| source tree | \`$TREE\` |"
-  case "$how" in
-    reused) echo "| image | **reused**: a build of this tree already exists, nothing was built |" ;;
-    built) echo "| image | **built** and pushed as \`tree-${TREE:0:12}...\` |" ;;
-    *) echo "| image | built locally, not pushed (this run cannot push) |" ;;
-  esac
-  [ -z "$digest" ] || echo "| digest | \`$digest\` |"
+  if [ -n "$TREE" ] && { [ "$HOW" = reused ] || [ "$HOW" = built ]; }; then
+    echo "| Tag | \`tree-$TREE\` |"
+  fi
+  [ -z "$DIGEST" ] || echo "| Digest | \`$DIGEST\` |"
+  if [ -n "${SCAN:-}" ]; then
+    case "$SCAN" in
+      success) echo "| Trivy scan | passed: no HIGH or CRITICAL vulnerabilities |" ;;
+      failure) echo "| Trivy scan | **failed**: HIGH or CRITICAL vulnerabilities, or the scan could not run. The table is in the log of the step \"Run Trivy vulnerability scanner\" |" ;;
+      *) echo "| Trivy scan | not run |" ;;
+    esac
+  fi
 } >> "$GITHUB_STEP_SUMMARY"
 """
 
@@ -320,6 +337,18 @@ def record_step(push):
             "        run: |\n" + script(RECORD_SCRIPT))
 
 
+def summary_step(scan):
+    """The last step of an image job. `scan` = True when the Trivy step (id `trivy`) is in the same job."""
+    return ("      - name: Write the image summary\n"
+            "        if: ${{ !cancelled() }}\n"
+            "        env:\n"
+            "          TREE: ${{ steps.find.outputs.tree }}\n"
+            "          HOW: ${{ steps.image.outputs.how }}\n"
+            "          DIGEST: ${{ steps.image.outputs.digest }}\n"
+            + ("          SCAN: ${{ steps.trivy.outcome }}\n" if scan else "") +
+            "        run: |\n" + script(SUMMARY_SCRIPT))
+
+
 def trivy_version():
     """The Trivy release docker-build.yaml scans with: bumped in that one reviewed place."""
     m = re.search(r"version: (v\d+\.\d+\.\d+)\n\s+image-ref:", read_text("docker-build.yaml"))
@@ -329,6 +358,7 @@ def trivy_version():
 
 def trivy_step(image_ref, why):
     return ("      - name: Run Trivy vulnerability scanner\n"
+            "        id: trivy\n"
             f"        uses: {pin('aquasecurity/trivy-action')}\n"
             "        with:\n"
             f"          # {why}\n"

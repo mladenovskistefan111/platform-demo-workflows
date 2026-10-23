@@ -47,10 +47,52 @@ jobs:
             return 1
           }
 
+          files=()        # every changed file, once the comparison got that far
+          first_code=""   # the first of them that is not documentation or metadata
+          workflows=0     # 1 when a workflow file or a local action is part of the change
+          skipped="Tests, scans and the image build are skipped."
+
+          # A file name is untrusted text. For the log and the summary: printable ASCII only (anything else becomes ?), no backtick
+          # (so it cannot leave its code span), at most 200 characters.
+          safe() { printf '%s' "$1" | LC_ALL=C tr -c '\040-\176' '?' | tr '`' "'" | cut -c1-200; }
+
+          write_summary() { # write_summary <true|false> <reason>
+            local n=${#files[@]} i
+            {
+              echo "### What changed"
+              echo
+              if [ "$1" = false ]; then
+                echo "**Documentation only.** $skipped"
+              elif [ -n "$first_code" ]; then
+                echo "**Code changed.** \`$(safe "$first_code")\` is not documentation or metadata, so everything runs."
+              else
+                echo "**Treated as a code change.** Reason: $2."
+              fi
+              if [ "$n" -gt 0 ]; then
+                echo
+                echo "$n changed file$([ "$n" -eq 1 ] || echo s)."
+              fi
+              if [ "$EVENT_NAME" = pull_request ] && [ "$workflows" = 1 ]; then
+                echo
+                echo "**Workflow files are part of this change.** Approving the merge includes them: read them first."
+              fi
+              if [ "$n" -gt 0 ]; then
+                echo
+                echo "<details><summary>Changed files ($n)</summary>"
+                echo
+                for ((i = 0; i < n && i < 50; i++)); do
+                  echo "- \`$(safe "${files[$i]}")\`"
+                done
+                if [ "$n" -gt 50 ]; then echo "- and $((n - 50)) more"; fi
+                echo
+                echo "</details>"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
           decide() { # decide <true|false> <reason>
             echo "code=$1" >> "$GITHUB_OUTPUT"
-            echo "### Change detection: code = $1" >> "$GITHUB_STEP_SUMMARY"
-            echo "$2" >> "$GITHUB_STEP_SUMMARY"
+            write_summary "$1" "$2"
             echo "code=$1 ($2)"
             exit 0
           }
@@ -75,13 +117,15 @@ jobs:
               ;;
           esac
 
-          total=0
           while IFS= read -r -d '' file; do
-            total=$((total + 1))
-            if ! is_docs "$file"; then
-              decide true "first code file: $file"
+            files+=("$file")
+            case "$file" in .github/workflows/* | .github/actions/*) workflows=1 ;; esac
+            if [ -z "$first_code" ] && ! is_docs "$file"; then
+              first_code=$file
             fi
           done < <(git diff -z --name-only --no-renames "$base" HEAD)
 
+          total=${#files[@]}
           [ "$total" -gt 0 ] || decide true "empty change"
+          [ -z "$first_code" ] || decide true "first code file: $(safe "$first_code")"
           decide false "$total file(s) changed, all documentation or metadata"
