@@ -16,11 +16,11 @@ commit but has the **same tree** when `main` did not move in between. So:
 
 | Where | What happens |
 |---|---|
-| Pull request, `Image: Build + CVE scan` (job `image` of `service-ci-<language>`) | compute `TREE`; if `ghcr.io/<repo>:tree-<TREE>` exists, reuse its digest (no build); else build with the registry cache and push it under that tag; scan **that digest** with Trivy (same version, threshold and ignore file everywhere) |
+| Pull request, `Image build and scan` (job `image` of `service-ci-<language>`) | compute `TREE`; if `ghcr.io/<repo>:tree-<TREE>` exists, reuse its digest (no build); else build with the registry cache and push it under that tag; scan **that digest** with Trivy (same version, threshold and ignore file everywhere) |
 | Pull request from a fork, or opened by Dependabot | the token cannot write packages: build into the local daemon and scan that, as before. Nothing is pushed, nothing is reused; the publish builds the tree itself after the merge |
-| Publish, `Image: Find or build` | compute `TREE` of the main commit; **found** = reuse the digest, no build; **not found** = build it now (cache written) and push as `tree-<TREE>` (the same tag, so a re-run finds it) |
-| Publish, `Image: Scan` | always scan the digest again, whether reused or built: new CVEs may have appeared since the pull request |
-| Publish, `Publish: Copy, sign, verify` | copy that digest by digest to Docker Hub as `sha-<7 chars of the main commit>` (no `latest`, no semver), cosign sign (keyless), verify; **a Docker Hub digest that differs from the scanned one fails the run**; an existing `sha-<7>` tag with another digest is never moved |
+| Publish, `Find or build image` | compute `TREE` of the main commit; **found** = reuse the digest, no build; **not found** = build it now (cache written) and push as `tree-<TREE>` (the same tag, so a re-run finds it) |
+| Publish, `Scan image` | always scan the digest again, whether reused or built: new CVEs may have appeared since the pull request |
+| Publish, `Publish image` | copy that digest by digest to Docker Hub as `sha-<7 chars of the main commit>` (no `latest`, no semver), cosign sign (keyless), verify; **a Docker Hub digest that differs from the scanned one fails the run**; an existing `sha-<7>` tag with another digest is never moved |
 
 **When the tree is not found:** another merge landed first (the tested merge result differs from what `main` became), the branch was
 rebased with other changes, the PR image was pruned (more than `prune-keep-tree` newer `tree-*` versions exist), the pull request was from a fork or
@@ -31,8 +31,10 @@ A re-run is cheap and consistent: the build pushed the tag, so the second run fi
 
 ## What is recorded where
 
-- Job summary of `Image: ...`: tree, reused or built, digest. Job summary of `Publish: Copy, sign, verify`: commit, tree, reused or built,
-  digest, Docker Hub tag, signature verified, link to the helm pull requests (the exact pull request is in the `Deploy: Open dev PR` summary).
+- Run summary of `Image build and scan` (pull request) and `Find or build image` (publish): reused or built, the `tree-<hash>` tag, the
+  digest, and for the pull request whether Trivy passed. Run summary of `Publish image`: commit, Docker Hub tag, digest, reused or built,
+  signature verified, the helm pull requests (the exact one is in the summary of `Open dev PR`). More in "Job names and run summaries" in
+  [How a service calls them](calling.md).
 - OCI labels on the image: `org.opencontainers.image.source`, `org.opencontainers.image.revision` (the commit the image was **built** at:
   a pull request's head commit, or the main commit when the publish built it), `io.platform-demo.tree`, `io.platform-demo.build-run`
   (the run that built it). The commit that was **shipped** is in the cosign certificate and in the `sha-<7>` tag.
@@ -54,7 +56,7 @@ A re-run is cheap and consistent: the build pushed the tag, so the second run fi
 
 ## Staging package on ghcr.io
 
-`ghcr.io/<repo>` holds `tree-<hash>` versions (and the older `sha-<commit>` versions of v3.3 and before). `Cleanup: Prune staging` keeps
+`ghcr.io/<repo>` holds `tree-<hash>` versions (and the older `sha-<commit>` versions of v3.3 and before). `Clean up staging images` keeps
 the newest N versions of **each** tag family (`prune-keep`, default 10, for `sha-*`; `prune-keep-tree`, default 20, for `tree-*`: every pull-request push makes a version), deletes the older ones and untagged versions older than seven
 days, but never a version with another tag (`latest`, `v1.2.3`), never an untagged manifest that a kept image index points to (the
 attestations and platform manifests of a kept image) and never the `buildcache` package (a package name with a slash cannot be addressed).
@@ -90,8 +92,8 @@ shows as waiting on the pull request until it is approved and is not required.
   token is not an admin and is not asked to bypass anything). Rules that block an API merge block this one too: required approving reviews
   above zero (the token cannot approve), unresolved conversations, "require branches to be up to date" when the branch is behind. The step
   then fails with "the merge was refused" and the pull request stays open; use the web button or update the branch.
-- A documentation-only pull request merges normally; the `Publish` run starts with `before` and its `Guard: Changes` finds only docs and
-  skips everything.
+- A documentation-only pull request merges normally; the `Publish` run starts with `before` and its `Detect changes` finds only docs and
+  skips everything (its summary says "Nothing is published.").
 - A new push to the pull request cancels the old `CI` run (`cancel-in-progress`), including a waiting approval. Approve the new run.
 - The branch moved while the approval was pending: refused, as above. `--match-head-commit` also covers the instant between the check and the merge.
 - Merged but Publish could not be started (the dispatch is retried three times): the job is red and the message gives the way out: Actions,

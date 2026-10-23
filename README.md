@@ -1,7 +1,7 @@
 # platform-demo-workflows
 
 Reusable GitHub Actions workflows shared by the platform-demo repositories. Services call these instead of carrying their own
-copy of a 300-line pipeline, so a fix or a version bump lands once. Current release: **v3.4.0** (history below). Callers pin the release they use by commit SHA: the developer portal calls v3.0.3; the service repositories call `service-ci-<language>`/`service-publish` (v3.4.0 once rolled out; until then v3.3.0, the pilot still v3.2.1) or, until they move, v2.0.2.
+copy of a 300-line pipeline, so a fix or a version bump lands once. Current release: **v3.5.0** (history below). Callers pin the release they use by commit SHA: the developer portal calls v3.0.3; the service repositories call `service-ci-<language>`/`service-publish` (v3.5.0 once rolled out; until then the release each repository pins: v3.4.0, v3.3.0, the pilot still v3.2.1) or, until they move, v2.0.2.
 
 | Workflow | Purpose | Used by |
 |---|---|---|
@@ -12,13 +12,13 @@ copy of a 300-line pipeline, so a fix or a version bump lands once. Current rele
 | [`dotnet-ci.yaml`](.github/workflows/dotnet-ci.yaml) | `dotnet format` + analyzers, secret scan, build, tests, vulnerable-package audit, Semgrep | cart |
 | [`docker-build.yaml`](.github/workflows/docker-build.yaml) | build once, stage on ghcr.io, Trivy-scan that exact digest (HIGH/CRITICAL fail) | callers pinned to v3.2.x or older; `service-publish` no longer calls it (its steps are inline) |
 | [`docker-promote.yaml`](.github/workflows/docker-promote.yaml) | copy the scanned digest to Docker Hub (no rebuild), tag, cosign-sign, self-verify, attach the SBOM as a signed `spdxjson` attestation, self-verify; refuses commits not on `main` | callers pinned to v3.2.x or older; `service-publish` has these steps inline (the copy now fails hard on a digest mismatch) |
-| [`secret-scan.yaml`](.github/workflows/secret-scan.yaml) | stand-alone gitleaks scan (the pull request's commits; full history on manual runs); also the source of the `Guard: Secrets` job of the service pipeline | helm, observability |
-| [`workflow-lint.yaml`](.github/workflows/workflow-lint.yaml) | stand-alone actionlint (+ shellcheck on CI runners) and "every `uses:` is pinned to a full commit SHA"; also the source of `Guard: Workflows` | repositories not on the service pipeline (this one included) |
-| [`service-ci-go.yaml`](.github/workflows/service-ci-go.yaml), [`-node`](.github/workflows/service-ci-node.yaml), [`-python`](.github/workflows/service-ci-python.yaml), [`-java`](.github/workflows/service-ci-java.yaml), [`-dotnet`](.github/workflows/service-ci-dotnet.yaml), [`-none`](.github/workflows/service-ci-none.yaml) | **generated** (tools/gen-service-ci.py), flat pull-request pipeline of an app repository, one file per language, only that language's jobs: guards (change detection, secrets, workflows), lint, build (+ optional smoke test), tests (+ optional E2E), SCA, SAST, image build (pushed as `ghcr.io/<repo>:tree-<hash>` by same-repository runs, reused by the publish) + Trivy scan of that digest, one `gate`. `none` = guards + image scan + gate (developer portal; product-catalog-db with `image: false`) | every app repository |
+| [`secret-scan.yaml`](.github/workflows/secret-scan.yaml) | stand-alone gitleaks scan (the pull request's commits; full history on manual runs); also the source of the `Secret scan` job of the service pipeline | helm, observability |
+| [`workflow-lint.yaml`](.github/workflows/workflow-lint.yaml) | stand-alone actionlint (+ shellcheck on CI runners) and "every `uses:` is pinned to a full commit SHA"; also the source of `Workflow lint` | repositories not on the service pipeline (this one included) |
+| [`service-ci-go.yaml`](.github/workflows/service-ci-go.yaml), [`-node`](.github/workflows/service-ci-node.yaml), [`-python`](.github/workflows/service-ci-python.yaml), [`-java`](.github/workflows/service-ci-java.yaml), [`-dotnet`](.github/workflows/service-ci-dotnet.yaml), [`-none`](.github/workflows/service-ci-none.yaml) | **generated** (tools/gen-service-ci.py), flat pull-request pipeline of an app repository, one file per language, only that language's jobs: guards (change detection, secrets, workflows), lint, build (+ optional smoke test), tests (+ optional E2E), dependency scan (SCA), code scan (SAST), image build (pushed as `ghcr.io/<repo>:tree-<hash>` by same-repository runs, reused by the publish) + Trivy scan of that digest, one `gate`. `none` = guards + image scan + gate (developer portal; product-catalog-db with `image: false`) | every app repository |
 | [`service-publish.yaml`](.github/workflows/service-publish.yaml) | **generated** (tools/gen-service-publish.py), ONE flat workflow, merge to `main`: find the image of this source tree (built by the pull request) or build it, scan the digest again, copy it to Docker Hub as `sha-<7>`, sign, verify (a digest mismatch fails the run); then in parallel the SBOM, the dev promotion PR and the staging prune. Graph below | every app repository |
 | [`service-merge.yaml`](.github/workflows/service-merge.yaml) | the merge button, called by the `merge` job of every app repository's `ci.yaml` after `ci / gate`: waits for the approval of the environment `merge`, checks the approval and that the branch is still the tested commit, squash-merges, starts `Publish` with `before` | every app repository |
 | [`release.yaml`](.github/workflows/release.yaml) | the tag button: Actions, Release, Run workflow, `vX.Y.Z`: creates the annotated tag on `main` and prints the commit SHA that callers pin | this repository |
-| [`changed-paths.yaml`](.github/workflows/changed-paths.yaml) | tells whether a change touches code or only docs/metadata (plain git, no token); `service-ci-*` carry an identical inline copy (`Guard: Changes`), `service-publish` one with the extra `before` input | older callers |
+| [`changed-paths.yaml`](.github/workflows/changed-paths.yaml) | tells whether a change touches code or only docs/metadata (plain git, no token); `service-ci-*` carry an identical inline copy (`Detect changes`, which also writes the "What changed" run summary), `service-publish` one with the extra `before` input | older callers |
 | [`gitops-promote.yaml`](.github/workflows/gitops-promote.yaml) | changes only `image.tag` and `image.digest` of one app in one environment of platform-demo-helm through a pull request (GitHub App token scoped to the helm repo, branch `promote/<app>/<env>` force-updated so a newer build replaces an older open one, squash auto-merge); idempotent | app publish workflows (dev), helm `Promote` (stage, prod) |
 | [`gitops-rollback.yaml`](.github/workflows/gitops-rollback.yaml) | moves an app back or forward to a digest that was deployed before (`previous`, `latest`, a digest or a helm commit) through a pull request (`rollback/<app>/<env>`, label `rollback`) that passes the same gates | helm `Rollback` |
 | [`scheduled-image-scan.yaml`](.github/workflows/scheduled-image-scan.yaml) | weekly Trivy scan of every deployed image digest (Monday 08:00 UTC); SARIF to the Security tab and one updated issue "Scheduled image scan" | helm `Scheduled scans` |
@@ -30,9 +30,9 @@ copy of a 300-line pipeline, so a fix or a version bump lands once. Current rele
 
 The **stand-alone** `go-ci`, `node-ci`, `python-ci`, `java-gradle-ci`, `dotnet-ci`, `secret-scan` and `workflow-lint` are for repositories
 that are not on the service pipeline (callers pinned to an older release, the developer portal). App repositories use `service-ci-<language>`.
-All six `service-ci-*` files have the same job names (`Guard: Changes`, `Guard: Secrets`, `Guard: Workflows`, `Check: Lint`, `Check: Build`,
-`Check: Tests`, `Security: SCA`, `Security: SAST`, `Image: Build + CVE scan`, `gate`), so branch protection looks the same everywhere. In a
-caller the check names are `<caller job id> / <job name>`, e.g. `ci / Check: Build`; the required one is `ci / gate`.
+All six `service-ci-*` files have the same job names (`Detect changes`, `Secret scan`, `Workflow lint`, `Lint`, `Build`, `Tests`,
+`Dependency scan`, `Code scan`, `Image build and scan`, `gate`), so branch protection looks the same everywhere. In a caller the check
+names are `<caller job id> / <job name>`, e.g. `ci / Build`; the required one is `ci / gate` (see "Job names and run summaries" below).
 
 ## How a service calls them
 
@@ -46,36 +46,36 @@ on: { pull_request: { branches: [main] }, workflow_dispatch: }
 permissions: {}
 concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }
 jobs:
-  ci: { permissions: { contents: read, packages: write }, uses: .../service-ci-go.yaml@<sha> # v3.4.0, with: { test-packages: ..., ... } }
+  ci: { permissions: { contents: read, packages: write }, uses: .../service-ci-go.yaml@<sha> # v3.5.0, with: { test-packages: ..., ... } }
   # service-ci-<go|node|python|java|dotnet|none>.yaml; only dotnet also needs checks: write (test reporter); product-catalog-db: -none with image: false
   merge:                                  # the merge button: NOT part of `gate`, after it; the logic is service-merge.yaml
     needs: ci
     if: pull_request, same repository, not Dependabot
     permissions: { contents: write, pull-requests: write, actions: write }
-    uses: .../service-merge.yaml@<sha> # v3.4.0   (product-catalog-db: with: { start-publish: false })
+    uses: .../service-merge.yaml@<sha> # v3.5.0   (product-catalog-db: with: { start-publish: false })
 # .github/workflows/publish.yaml (shape)
 on: { push: { branches: [main] }, workflow_dispatch: { inputs: { before: {type: string, default: ""} } } }
 concurrency: { group: publish-${{ github.ref }}, cancel-in-progress: false }
 jobs:
-  publish: { permissions: { contents: read, packages: write, id-token: write }, uses: .../service-publish.yaml@<sha> # v3.4.0,
+  publish: { permissions: { contents: read, packages: write, id-token: write }, uses: .../service-publish.yaml@<sha> # v3.5.0,
              with: { app: checkout-service, before: "${{ inputs.before }}" }, secrets: DOCKERHUB_USERNAME / DOCKERHUB_TOKEN / PROMOTE_APP_ID / PROMOTE_APP_PRIVATE_KEY }
 ```
 
 **`service-ci-<language>`** (pull request): flat, one file per language, so the Actions graph shows only what the repository runs. Left to
-right: the guards `Guard: Changes`, `Guard: Secrets`, `Guard: Workflows`; next to them `Check: Lint`, `Check: Build`, `Check: Tests`,
-`Security: SCA`, `Security: SAST` and `Image: Build + CVE scan`; at the end one `gate` job:
+right: `Detect changes`, `Secret scan`, `Workflow lint`; next to them `Lint`, `Build`, `Tests`, `Dependency scan` (SCA),
+`Code scan` (SAST) and `Image build and scan`; at the end one `gate` job:
 
 ```
-Guard: Changes ---+--> Check: Lint | Check: Build | Check: Tests | Security: SCA | Security: SAST | Image: Build + CVE scan --+
-Guard: Secrets  --+                                                                                                          +--> gate --> merge
-Guard: Workflows -+------------------------------------------------------------------------------------------------------+      (approval)
+Detect changes --+--> Lint | Build | Tests | Dependency scan | Code scan | Image build and scan --+
+Secret scan -----+                                                                                +--> gate --> merge
+Workflow lint ---+--------------------------------------------------------------------------------+      (approval)
 ```
 
 **The left column means "starts at t=0", not "must pass first"**: all nine jobs start together, the checks wait only for the change
 detection (a docs-only change skips them), so a flaky gitleaks download or one lint complaint does not hide the test, SAST and Trivy
-results. `gate` needs every job, always runs, lists the failed or cancelled jobs first (their consequent skips are not noise) and is strict
-about the rest: **`ci / gate` is the only required check**; `merge` is after it and is not part of it. The optional smoke test (Go, Node:
-input `smoke-port`) is a step of `Check: Build`, reusing the build; the optional E2E tests (Go: `e2e-packages`) a step of `Check: Tests`;
+results. `gate` needs every job, always runs, names the failed or cancelled job first (the skips that follow from it are not noise) and is strict
+about the rest; it works on job ids, never on the names: **`ci / gate` is the only required check**; `merge` is after it and is not part of it. The optional smoke test (Go, Node:
+input `smoke-port`) is a step of `Build`, reusing the build; the optional E2E tests (Go: `e2e-packages`) a step of `Tests`;
 there are no optional jobs that would show up as skipped.
 The image job builds the image once per source tree and, for a same-repository run, pushes it as `ghcr.io/<repo>:tree-<hash>` and scans that
 digest (see "Build once per tree" below); a fork's or Dependabot's run cannot push and builds into the local daemon as before.
@@ -88,20 +88,20 @@ is no placeholder pin or two-step release.
 (`tools/gen-service-publish.py`; the only nested workflow is the unchanged `gitops-promote.yaml@341f641`, shared with the helm repository):
 
 ```
-Guard: Changes -> Image: Find or build -> Image: Scan -> Publish: Copy, sign, verify -+-> Publish: SBOM
-                                                                                      +-> Deploy: Open dev PR   (gitops-promote.yaml)
-                                                                                      +-> Cleanup: Prune staging (best effort)
+Detect changes -> Find or build image -> Scan image -> Publish image -+-> Create SBOM
+                                                                      +-> Open dev PR   (gitops-promote.yaml)
+                                                                      +-> Clean up staging images (best effort)
 ```
 
 | Job | What it does |
 |---|---|
-| `Guard: Changes` | docs/metadata-only commit: nothing below runs. Push: diff `github.event.before..HEAD`. Manual run: with `before` it diffs `before..HEAD` the same way, without it everything runs |
-| `Image: Find or build` | `TREE=$(git rev-parse HEAD^{tree})`; looks for `ghcr.io/<repo>:tree-<TREE>`. Found = its digest is reused, no build. Not found (main moved, the tree differs, the image was pruned) = built now, registry cache written, pushed under the same tag |
-| `Image: Scan` | Trivy (HIGH/CRITICAL fail) on that digest, again: new CVEs may have appeared since the pull request |
-| `Publish: Copy, sign, verify` | refuses commits not reachable from `main`; copies the digest to Docker Hub as `sha-<7 chars of the commit>` only (no `latest`, no semver), never moves an existing tag, **fails hard if the Docker Hub digest differs from the scanned one**, cosign signs (keyless) and verifies. Job summary: tree, reused or built, digest, tag, signature, link to the helm pull requests |
-| `Publish: SBOM` | SPDX SBOM as a signed attestation, verified. Own job, so it is not on the way to the helm pull request; a failure fails the run visibly |
-| `Deploy: Open dev PR` | the pull request in the helm repository that moves `dev` to this digest (`permissions: {}`, App token) |
-| `Cleanup: Prune staging` | `continue-on-error: true`, never delays the helm pull request: keeps the newest `prune-keep` (10) `sha-*` and the newest `prune-keep-tree` (20) `tree-*` versions of the ghcr.io package, never the `buildcache` package, never an image-index child of a kept image |
+| `Detect changes` | docs/metadata-only commit: nothing below runs. Push: diff `github.event.before..HEAD`. Manual run: with `before` it diffs `before..HEAD` the same way, without it everything runs |
+| `Find or build image` | `TREE=$(git rev-parse HEAD^{tree})`; looks for `ghcr.io/<repo>:tree-<TREE>`. Found = its digest is reused, no build. Not found (main moved, the tree differs, the image was pruned) = built now, registry cache written, pushed under the same tag |
+| `Scan image` | Trivy (HIGH/CRITICAL fail) on that digest, again: new CVEs may have appeared since the pull request |
+| `Publish image` | refuses commits not reachable from `main`; copies the digest to Docker Hub as `sha-<7 chars of the commit>` only (no `latest`, no semver), never moves an existing tag, **fails hard if the Docker Hub digest differs from the scanned one**, cosign signs (keyless) and verifies. Its run summary answers "what was published": tag, commit, digest, reused or built, signature, where the dev change goes |
+| `Create SBOM` | SPDX SBOM as a signed attestation, verified. Own job, so it is not on the way to the helm pull request; a failure fails the run visibly |
+| `Open dev PR` | the pull request in the helm repository that moves `dev` to this digest (`permissions: {}`, App token) |
+| `Clean up staging images` | `continue-on-error: true`, never delays the helm pull request: keeps the newest `prune-keep` (10) `sha-*` and the newest `prune-keep-tree` (20) `tree-*` versions of the ghcr.io package, never the `buildcache` package, never an image-index child of a kept image |
 
 Concurrency (`publish-<ref>`, no cancel) lives in the caller: one publish at a time. **A run that waits behind a running one is replaced by
 a newer waiting one**, so of three quick merges the second never publishes by itself; the third publishes the tree of `main`, which contains
@@ -130,6 +130,92 @@ the run was approved, that the branch still is the tested commit, squash-merges 
 trigger, hence the explicit start; the normal GitHub Merge button still works and starts Publish by push, and the concurrency group keeps
 the two apart (a second run finds the tree image). The caller file is the pull request's own: **read a change to `.github/workflows`
 before you approve it.** Fork and Dependabot pull requests have no `merge` job (read-only token): use the normal button.
+
+### Job names and run summaries
+
+**Job names** (since v3.5.0): sentence case, what the job does, no group prefixes (no `Guard:`, `Check:`, `Security:`, `Image:`, `Publish:`,
+`Deploy:`, `Cleanup:`). Every job has an explicit, stable `name:`; the job id (`image`, `sca`, ...) does not change. GitHub shows a called
+job as `<caller job id> / <job name>`, so the caller's job id is the prefix: `ci / Build`, `ci / Code scan`, `publish / Publish image`.
+Language detail belongs in the step names (`Run golangci-lint`, `Run gosec`). The required check is `ci / gate`: `gate` stays lowercase
+because it is the one name branch protection pins. `tools/check-consistency.py` fails on any other name, on a `Group:` prefix and on a
+missing `name:`; the gate reads job **ids** from `needs`, never names (it only prints the names).
+
+| Job id | Name in `service-ci-<language>` | Was (v3.4.0) |
+|---|---|---|
+| `changes` | Detect changes | Guard: Changes |
+| `secret-scan` | Secret scan | Guard: Secrets |
+| `workflow-lint` | Workflow lint | Guard: Workflows |
+| `lint` | Lint | Check: Lint |
+| `build` | Build | Check: Build |
+| `test` | Tests | Check: Tests |
+| `sca` | Dependency scan | Security: SCA |
+| `sast` | Code scan | Security: SAST |
+| `image` | Image build and scan | Image: Build + CVE scan |
+| `gate` | gate | gate |
+
+| Job id | Name in `service-publish` | Was (v3.4.0) |
+|---|---|---|
+| `changes` | Detect changes | Guard: Changes |
+| `image` | Find or build image | Image: Find or build |
+| `scan` | Scan image | Image: Scan |
+| `publish` | Publish image | Publish: Copy, sign, verify |
+| `sbom` | Create SBOM | Publish: SBOM |
+| `deploy` | Open dev PR | Deploy: Open dev PR |
+| `prune` | Clean up staging images | Cleanup: Prune staging |
+
+`service-merge` keeps `Approve and merge`.
+
+**Run summaries** (the markdown on the run page, `GITHUB_STEP_SUMMARY`): status first, only the key facts, details folded in `<details>`,
+ids in code, no emojis in headings. A summary belongs to one job, so every job writes its own short section and none passes data around:
+
+| Run | Job | Section |
+|---|---|---|
+| pull request | `Detect changes` | **What changed**: code or documentation only, the number of changed files, the list (first 50) in `<details>`, a warning when workflow files are part of the change |
+| pull request | `Image build and scan` | **Image**: reused, built or built locally; the `tree-<hash>` tag; the digest; whether the Trivy scan passed (the findings are in the step's log) |
+| pull request | `gate` | the verdict first (`Ready to merge`, or `Blocked: <job> failed`), what changed, one row per job, and what the `merge` job will do |
+| publish | `Detect changes` | the same **What changed**; for a documentation-only commit: "Nothing is published." |
+| publish | `Find or build image`, `Scan image` | **Image** (reused or built, tag, digest), **Image scan** (Trivy result) |
+| publish | `Publish image` | **Published `sha-<7>`**: commit, Docker Hub tag, digest, reused or built, signature verified, where the dev change goes |
+| publish | `Create SBOM` | **SBOM**: attached to the digest as a signed attestation, verified |
+| publish | `Open dev PR` | the section of `gitops-promote.yaml` (unchanged): link to the helm pull request, tag, digest, source commit |
+| publish | `Clean up staging images` | versions before, deleted, remaining, failures; the deleted list folded in `<details>` |
+
+Limits and care: GitHub rejects a step summary over 1 MiB, so lists are cut (50 file names, at most 100 deleted versions). File names,
+tags and caller inputs are untrusted text: they appear only inside code spans, as printable ASCII (anything else becomes `?`), without
+backticks, at most 200 characters. The Trivy counts are not in the summary: the action prints a table in the log, and counting would need a
+second scan. `gitops-promote.yaml` is shared with the helm repository and pinned by SHA, so `Open dev PR` keeps its own summary.
+
+Example, a green pull request (`gate`):
+
+```
+### Ready to merge
+
+Change: **code**. All checks apply.
+
+| Job | Result |
+|---|---|
+| Detect changes | passed |
+| Secret scan | passed |
+| ... | passed |
+| Image build and scan | passed |
+
+**Merge button:** approve the `merge` environment on this run page (Review deployments) to squash-merge this pull request and start Publish.
+```
+
+Example, the publish job:
+
+```
+### Published `sha-1234567`
+
+| | |
+|---|---|
+| Commit | [`1234567`](https://github.com/<org>/<repo>/commit/<sha>) |
+| Docker Hub tag | `sha-1234567` |
+| Digest | `sha256:...` |
+| Image | reused: built by the pull request from source tree `<tree>`, not built again |
+| Signature | verified (keyless cosign; the certificate names this workflow and commit `1234567`) |
+| Dev change | the pull request in platform-demo-helm that moves `dev` of `<app>` to this digest (link), opened by the `Open dev PR` job (its summary links the exact one) |
+```
 
 ## Release model (trunk-based)
 
@@ -181,7 +267,7 @@ required checks taken from a repo's last green PR, squash-only merges, secret sc
   `https://github.com/platform-boutique/platform-demo-workflows/.github/workflows/service-publish.yaml@<sha-or-ref>` since v3.4.0 (`docker-promote.yaml` before; images signed before the move to the organisation: `https://github.com/mladenovskistefan111/platform-demo-workflows/...`; both are accepted); images
   signed by the older per-repo pipelines carry `.../<service>/.github/workflows/ci-main.yaml@refs/heads/...`.
 - **Staging on ghcr.io, publishing by digest:** what Trivy scanned is byte-for-byte what is published and signed; since v3.4.0 a Docker Hub digest that differs from the scanned one fails the run.
-- **A job output that contains a secret is dropped by GitHub.** The Docker Hub image reference contains the account name (a secret), so `Publish: Copy, sign, verify` outputs only the digest and the tag; the SBOM job rebuilds the reference.
+- **A job output that contains a secret is dropped by GitHub.** The Docker Hub image reference contains the account name (a secret), so `Publish image` outputs only the digest and the tag; the SBOM job rebuilds the reference.
 - **A missing GitHub environment is created without protection on first use.** The `merge` job therefore asks the run for an approval of the environment `merge` and refuses to merge without one.
 - **`gradle/actions` is held at v5**: v6 puts its caching component under proprietary terms; nobody accepted them.
 - **Pins use a 7-day cooldown** (a brand-new release is a supply-chain risk). Dependabot is configured with majors as separate PRs.
@@ -208,6 +294,7 @@ required checks taken from a repo's last green PR, squash-only merges, secret sc
 | v3.2.1 | fix: `service-ci` / `service-publish` failed at startup (`startup_failure`) because GitHub checks the permissions of every nested job, skipped ones too: generated `ci.yaml` callers now grant `checks: write` (the dotnet job), the prune job of `service-publish` gets `contents: read`; new `tools/check-permissions.py` (run in this repository's CI) walks the nested workflows against the callers' grants |
 | v3.3.0 | `service-ci.yaml` is replaced by flat, generated, per-language pull-request workflows `service-ci-go`, `-node`, `-python`, `-java`, `-dotnet` and `-none` (tools/gen-service-ci.py). The Actions graph of a caller showed every language behind `if:` as hollow skipped boxes (and a duplicate Secret Scan, skipped E2E/smoke jobs, truncated names); now every file contains only the jobs its language runs, with no nested workflow, short names (`ci / Check: Build`) and the same shape everywhere: `Guard: Changes`, `Guard: Secrets`, `Guard: Workflows` start at t=0, the checks (`Check: Lint/Build/Tests`, `Security: SCA/SAST`, `Image: Build + CVE scan`) need only the change detection, `gate` waits for all and names the failed job first. The optional smoke test (Go, Node) is a step of `Check: Build` and the E2E tests (Go) a step of `Check: Tests` (no skipped jobs, one build). Because nothing is nested, a caller needs only `contents: read` + `packages: read` (`checks: write` for dotnet only) and there is no placeholder pin / two-step release (`tools/pin-service-workflows.sh` is gone). Callers: new `uses:` file name, no `language:` input, same `with:` otherwise; the required check stays `ci / gate`. `service-ci.yaml` is removed (v3.2.1 stays valid for callers pinned to it) |
 | v3.4.0 | **Build once per source tree, flat publish, merge and tag buttons.** The pull request's `Image: Build + CVE scan` now pushes the image as `ghcr.io/<repo>:tree-<git tree hash>` for same-repository runs (forks and Dependabot build locally as before) and scans that digest; the publish after the merge looks for the image of the main commit's tree and ships it without building (found), or builds it once and pushes it under the same tag (not found: main moved, tree differs, image pruned), then scans the digest again. Why: the image was built twice (pull request, then publish) and what was tested was not literally what shipped. `service-publish.yaml` is one flat generated workflow (`tools/gen-service-publish.py`) instead of calling `docker-build`, `docker-promote` and `ghcr-prune` (no nested publish boxes in the graph, no two-step release): `Guard: Changes`, `Image: Find or build`, `Image: Scan`, `Publish: Copy, sign, verify`, then in parallel `Publish: SBOM`, `Deploy: Open dev PR` and `Cleanup: Prune staging` (best effort, keeps the newest N `sha-*` and `tree-*` versions). The Docker Hub copy fails hard when its digest differs from the scanned one and never moves an existing `sha-<7>` tag; the SBOM attestation is its own job, off the way to the helm pull request. New input `before` (a manual run diffs `before..HEAD`, so a docs-only merge publishes nothing); output `image` is dropped (it carried the secret account name). Callers: `ci.yaml` gets a short `merge` job that calls the new `service-merge.yaml` (environment `merge`, owner approves, squash-merge, starts Publish), the ci grant becomes `contents: read` + `packages: write`, `publish.yaml` accepts and passes `before`. The registry build cache is also refreshed by pull-request runs that push; `prune-keep` (10, `sha-*`) and new `prune-keep-tree` (20, `tree-*`) are separate. New `release.yaml` (Actions, Release, Run workflow: creates the tag, prints the SHA to pin). New `tools/wfgen.py`, `tools/gen-service-publish.py`, `tools/test-shell.py`; `check-consistency.py` and `check-permissions.py` cover the flat publish, the merge job and the shared image steps. The cosign identity of new images is `service-publish.yaml@<sha>` (every verifier accepts any workflow of the workflows repository). `docker-build`, `docker-promote`, `ghcr-prune`, `changed-paths` stay for older callers |
+| v3.5.0 | **Plain job names and useful run summaries** (no change to the graph, the job ids, the inputs, the permissions or the callers except the pin). Job names have no group prefixes any more: sentence case, what the job does. `service-ci-*`: `Detect changes`, `Secret scan`, `Workflow lint`, `Lint`, `Build`, `Tests`, `Dependency scan` (was SCA), `Code scan` (was SAST), `Image build and scan`, `gate` (unchanged; the required check stays `ci / gate`). `service-publish`: `Detect changes`, `Find or build image`, `Scan image`, `Publish image`, `Create SBOM`, `Open dev PR`, `Clean up staging images`. `service-merge`: `Approve and merge` (unchanged). Every job has an explicit `name:`; `check-consistency.py` pins the names and rejects a `Group:` prefix. Run summaries: the pull request's `Detect changes` writes what changed (code or documentation only, number of files, the list folded away, a warning when workflow files are part of the change), `Image build and scan` the image (reused or built, tree tag, digest, Trivy passed or failed), and `gate` the verdict first (`Ready to merge` / `Blocked: <job> failed`), the results and what the Merge button will do. The publish run: `Publish image` states what was published (tag, commit, digest, reused or built, signature, where the dev change goes), `Create SBOM`, `Scan image` and `Clean up staging images` write a short section each. File names, tags and caller inputs are escaped (code spans, printable ASCII, capped lists). `changed-paths.yaml` writes the same summary for the older callers. `test-gate.py` and `test-shell.py` cover the summaries |
 
 ## The Terraform workflows
 

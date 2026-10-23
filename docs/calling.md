@@ -10,36 +10,36 @@ on: { pull_request: { branches: [main] }, workflow_dispatch: }
 permissions: {}
 concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }
 jobs:
-  ci: { permissions: { contents: read, packages: write }, uses: .../service-ci-go.yaml@<sha> # v3.4.0, with: { test-packages: ..., ... } }
+  ci: { permissions: { contents: read, packages: write }, uses: .../service-ci-go.yaml@<sha> # v3.5.0, with: { test-packages: ..., ... } }
   # service-ci-<go|node|python|java|dotnet|none>.yaml; only dotnet also needs checks: write (test reporter); product-catalog-db: -none with image: false
   merge:                                  # the merge button: NOT part of `gate`, after it; the logic is service-merge.yaml
     needs: ci
     if: pull_request, same repository, not Dependabot
     permissions: { contents: write, pull-requests: write, actions: write }
-    uses: .../service-merge.yaml@<sha> # v3.4.0   (product-catalog-db: with: { start-publish: false })
+    uses: .../service-merge.yaml@<sha> # v3.5.0   (product-catalog-db: with: { start-publish: false })
 # .github/workflows/publish.yaml (shape)
 on: { push: { branches: [main] }, workflow_dispatch: { inputs: { before: {type: string, default: ""} } } }
 concurrency: { group: publish-${{ github.ref }}, cancel-in-progress: false }
 jobs:
-  publish: { permissions: { contents: read, packages: write, id-token: write }, uses: .../service-publish.yaml@<sha> # v3.4.0,
+  publish: { permissions: { contents: read, packages: write, id-token: write }, uses: .../service-publish.yaml@<sha> # v3.5.0,
              with: { app: checkout-service, before: "${{ inputs.before }}" }, secrets: DOCKERHUB_USERNAME / DOCKERHUB_TOKEN / PROMOTE_APP_ID / PROMOTE_APP_PRIVATE_KEY }
 ```
 
 **`service-ci-<language>`** (pull request): flat, one file per language, so the Actions graph shows only what the repository runs. Left to
-right: the guards `Guard: Changes`, `Guard: Secrets`, `Guard: Workflows`; next to them `Check: Lint`, `Check: Build`, `Check: Tests`,
-`Security: SCA`, `Security: SAST` and `Image: Build + CVE scan`; at the end one `gate` job:
+right: `Detect changes`, `Secret scan`, `Workflow lint`; next to them `Lint`, `Build`, `Tests`, `Dependency scan` (SCA),
+`Code scan` (SAST) and `Image build and scan`; at the end one `gate` job:
 
 ```
-Guard: Changes ---+--> Check: Lint | Check: Build | Check: Tests | Security: SCA | Security: SAST | Image: Build + CVE scan --+
-Guard: Secrets  --+                                                                                                          +--> gate --> merge
-Guard: Workflows -+------------------------------------------------------------------------------------------------------+      (approval)
+Detect changes --+--> Lint | Build | Tests | Dependency scan | Code scan | Image build and scan --+
+Secret scan -----+                                                                                +--> gate --> merge
+Workflow lint ---+--------------------------------------------------------------------------------+      (approval)
 ```
 
 **The left column means "starts at t=0", not "must pass first"**: all nine jobs start together, the checks wait only for the change
 detection (a docs-only change skips them), so a flaky gitleaks download or one lint complaint does not hide the test, SAST and Trivy
-results. `gate` needs every job, always runs, lists the failed or cancelled jobs first (their consequent skips are not noise) and is strict
-about the rest: **`ci / gate` is the only required check**; `merge` is after it and is not part of it. The optional smoke test (Go, Node:
-input `smoke-port`) is a step of `Check: Build`, reusing the build; the optional E2E tests (Go: `e2e-packages`) a step of `Check: Tests`;
+results. `gate` needs every job, always runs, names the failed or cancelled job first (the skips that follow from it are not noise) and is strict
+about the rest; it works on job ids, never on the names: **`ci / gate` is the only required check**; `merge` is after it and is not part of it. The optional smoke test (Go, Node:
+input `smoke-port`) is a step of `Build`, reusing the build; the optional E2E tests (Go: `e2e-packages`) a step of `Tests`;
 there are no optional jobs that would show up as skipped.
 The image job builds the image once per source tree and, for a same-repository run, pushes it as `ghcr.io/<repo>:tree-<hash>` and scans that
 digest (see "Build once per tree" below); a fork's or Dependabot's run cannot push and builds into the local daemon as before.
@@ -52,20 +52,20 @@ is no placeholder pin or two-step release.
 (`tools/gen-service-publish.py`; the only nested workflow is the unchanged `gitops-promote.yaml@341f641`, shared with the helm repository):
 
 ```
-Guard: Changes -> Image: Find or build -> Image: Scan -> Publish: Copy, sign, verify -+-> Publish: SBOM
-                                                                                      +-> Deploy: Open dev PR   (gitops-promote.yaml)
-                                                                                      +-> Cleanup: Prune staging (best effort)
+Detect changes -> Find or build image -> Scan image -> Publish image -+-> Create SBOM
+                                                                      +-> Open dev PR   (gitops-promote.yaml)
+                                                                      +-> Clean up staging images (best effort)
 ```
 
 | Job | What it does |
 |---|---|
-| `Guard: Changes` | docs/metadata-only commit: nothing below runs. Push: diff `github.event.before..HEAD`. Manual run: with `before` it diffs `before..HEAD` the same way, without it everything runs |
-| `Image: Find or build` | `TREE=$(git rev-parse HEAD^{tree})`; looks for `ghcr.io/<repo>:tree-<TREE>`. Found = its digest is reused, no build. Not found (main moved, the tree differs, the image was pruned) = built now, registry cache written, pushed under the same tag |
-| `Image: Scan` | Trivy (HIGH/CRITICAL fail) on that digest, again: new CVEs may have appeared since the pull request |
-| `Publish: Copy, sign, verify` | refuses commits not reachable from `main`; copies the digest to Docker Hub as `sha-<7 chars of the commit>` only (no `latest`, no semver), never moves an existing tag, **fails hard if the Docker Hub digest differs from the scanned one**, cosign signs (keyless) and verifies. Job summary: tree, reused or built, digest, tag, signature, link to the helm pull requests |
-| `Publish: SBOM` | SPDX SBOM as a signed attestation, verified. Own job, so it is not on the way to the helm pull request; a failure fails the run visibly |
-| `Deploy: Open dev PR` | the pull request in the helm repository that moves `dev` to this digest (`permissions: {}`, App token) |
-| `Cleanup: Prune staging` | `continue-on-error: true`, never delays the helm pull request: keeps the newest `prune-keep` (10) `sha-*` and the newest `prune-keep-tree` (20) `tree-*` versions of the ghcr.io package, never the `buildcache` package, never an image-index child of a kept image |
+| `Detect changes` | docs/metadata-only commit: nothing below runs. Push: diff `github.event.before..HEAD`. Manual run: with `before` it diffs `before..HEAD` the same way, without it everything runs |
+| `Find or build image` | `TREE=$(git rev-parse HEAD^{tree})`; looks for `ghcr.io/<repo>:tree-<TREE>`. Found = its digest is reused, no build. Not found (main moved, the tree differs, the image was pruned) = built now, registry cache written, pushed under the same tag |
+| `Scan image` | Trivy (HIGH/CRITICAL fail) on that digest, again: new CVEs may have appeared since the pull request |
+| `Publish image` | refuses commits not reachable from `main`; copies the digest to Docker Hub as `sha-<7 chars of the commit>` only (no `latest`, no semver), never moves an existing tag, **fails hard if the Docker Hub digest differs from the scanned one**, cosign signs (keyless) and verifies. Its run summary answers "what was published": tag, commit, digest, reused or built, signature, where the dev change goes |
+| `Create SBOM` | SPDX SBOM as a signed attestation, verified. Own job, so it is not on the way to the helm pull request; a failure fails the run visibly |
+| `Open dev PR` | the pull request in the helm repository that moves `dev` to this digest (`permissions: {}`, App token) |
+| `Clean up staging images` | `continue-on-error: true`, never delays the helm pull request: keeps the newest `prune-keep` (10) `sha-*` and the newest `prune-keep-tree` (20) `tree-*` versions of the ghcr.io package, never the `buildcache` package, never an image-index child of a kept image |
 
 Concurrency (`publish-<ref>`, no cancel) lives in the caller: one publish at a time. **A run that waits behind a running one is replaced by
 a newer waiting one**, so of three quick merges the second never publishes by itself; the third publishes the tree of `main`, which contains
@@ -94,3 +94,89 @@ the run was approved, that the branch still is the tested commit, squash-merges 
 trigger, hence the explicit start; the normal GitHub Merge button still works and starts Publish by push, and the concurrency group keeps
 the two apart (a second run finds the tree image). The caller file is the pull request's own: **read a change to `.github/workflows`
 before you approve it.** Fork and Dependabot pull requests have no `merge` job (read-only token): use the normal button.
+
+### Job names and run summaries
+
+**Job names** (since v3.5.0): sentence case, what the job does, no group prefixes (no `Guard:`, `Check:`, `Security:`, `Image:`, `Publish:`,
+`Deploy:`, `Cleanup:`). Every job has an explicit, stable `name:`; the job id (`image`, `sca`, ...) does not change. GitHub shows a called
+job as `<caller job id> / <job name>`, so the caller's job id is the prefix: `ci / Build`, `ci / Code scan`, `publish / Publish image`.
+Language detail belongs in the step names (`Run golangci-lint`, `Run gosec`). The required check is `ci / gate`: `gate` stays lowercase
+because it is the one name branch protection pins. `tools/check-consistency.py` fails on any other name, on a `Group:` prefix and on a
+missing `name:`; the gate reads job **ids** from `needs`, never names (it only prints the names).
+
+| Job id | Name in `service-ci-<language>` | Was (v3.4.0) |
+|---|---|---|
+| `changes` | Detect changes | Guard: Changes |
+| `secret-scan` | Secret scan | Guard: Secrets |
+| `workflow-lint` | Workflow lint | Guard: Workflows |
+| `lint` | Lint | Check: Lint |
+| `build` | Build | Check: Build |
+| `test` | Tests | Check: Tests |
+| `sca` | Dependency scan | Security: SCA |
+| `sast` | Code scan | Security: SAST |
+| `image` | Image build and scan | Image: Build + CVE scan |
+| `gate` | gate | gate |
+
+| Job id | Name in `service-publish` | Was (v3.4.0) |
+|---|---|---|
+| `changes` | Detect changes | Guard: Changes |
+| `image` | Find or build image | Image: Find or build |
+| `scan` | Scan image | Image: Scan |
+| `publish` | Publish image | Publish: Copy, sign, verify |
+| `sbom` | Create SBOM | Publish: SBOM |
+| `deploy` | Open dev PR | Deploy: Open dev PR |
+| `prune` | Clean up staging images | Cleanup: Prune staging |
+
+`service-merge` keeps `Approve and merge`.
+
+**Run summaries** (the markdown on the run page, `GITHUB_STEP_SUMMARY`): status first, only the key facts, details folded in `<details>`,
+ids in code, no emojis in headings. A summary belongs to one job, so every job writes its own short section and none passes data around:
+
+| Run | Job | Section |
+|---|---|---|
+| pull request | `Detect changes` | **What changed**: code or documentation only, the number of changed files, the list (first 50) in `<details>`, a warning when workflow files are part of the change |
+| pull request | `Image build and scan` | **Image**: reused, built or built locally; the `tree-<hash>` tag; the digest; whether the Trivy scan passed (the findings are in the step's log) |
+| pull request | `gate` | the verdict first (`Ready to merge`, or `Blocked: <job> failed`), what changed, one row per job, and what the `merge` job will do |
+| publish | `Detect changes` | the same **What changed**; for a documentation-only commit: "Nothing is published." |
+| publish | `Find or build image`, `Scan image` | **Image** (reused or built, tag, digest), **Image scan** (Trivy result) |
+| publish | `Publish image` | **Published `sha-<7>`**: commit, Docker Hub tag, digest, reused or built, signature verified, where the dev change goes |
+| publish | `Create SBOM` | **SBOM**: attached to the digest as a signed attestation, verified |
+| publish | `Open dev PR` | the section of `gitops-promote.yaml` (unchanged): link to the helm pull request, tag, digest, source commit |
+| publish | `Clean up staging images` | versions before, deleted, remaining, failures; the deleted list folded in `<details>` |
+
+Limits and care: GitHub rejects a step summary over 1 MiB, so lists are cut (50 file names, at most 100 deleted versions). File names,
+tags and caller inputs are untrusted text: they appear only inside code spans, as printable ASCII (anything else becomes `?`), without
+backticks, at most 200 characters. The Trivy counts are not in the summary: the action prints a table in the log, and counting would need a
+second scan. `gitops-promote.yaml` is shared with the helm repository and pinned by SHA, so `Open dev PR` keeps its own summary.
+
+Example, a green pull request (`gate`):
+
+```
+### Ready to merge
+
+Change: **code**. All checks apply.
+
+| Job | Result |
+|---|---|
+| Detect changes | passed |
+| Secret scan | passed |
+| ... | passed |
+| Image build and scan | passed |
+
+**Merge button:** approve the `merge` environment on this run page (Review deployments) to squash-merge this pull request and start Publish.
+```
+
+Example, the publish job:
+
+```
+### Published `sha-1234567`
+
+| | |
+|---|---|
+| Commit | [`1234567`](https://github.com/<org>/<repo>/commit/<sha>) |
+| Docker Hub tag | `sha-1234567` |
+| Digest | `sha256:...` |
+| Image | reused: built by the pull request from source tree `<tree>`, not built again |
+| Signature | verified (keyless cosign; the certificate names this workflow and commit `1234567`) |
+| Dev change | the pull request in platform-demo-helm that moves `dev` of `<app>` to this digest (link), opened by the `Open dev PR` job (its summary links the exact one) |
+```

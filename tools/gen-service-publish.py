@@ -3,9 +3,14 @@
 
 usage: gen-service-publish.py [repo-root]      (writes <repo-root>/.github/workflows/service-publish.yaml)
 
-    Guard: Changes -> Image: Find or build -> Image: Scan -> Publish: Copy, sign, verify -+-> Publish: SBOM
-                                                                                          +-> Deploy: Open dev PR
-                                                                                          +-> Cleanup: Prune staging
+    Detect changes -> Find or build image -> Scan image -> Publish image -+-> Create SBOM
+                                                                          +-> Open dev PR
+                                                                          +-> Clean up staging images
+
+Run summaries (GITHUB_STEP_SUMMARY, one section per job on the run page): `Detect changes` what changed (changed-paths.yaml),
+`Find or build image` reused or built + digest (tools/wfgen.py), `Scan image` the Trivy result, `Publish image` the answer to "what was
+published": tag, commit, digest, signature, where the dev change goes; `Create SBOM`; `Open dev PR` (gitops-promote.yaml's own section
+with the pull request link); `Clean up staging images` kept / deleted counts.
 
 Why generated and flat: until v3.3 the publish workflow called docker-build, docker-promote and ghcr-prune (nested boxes in the
 Actions graph, each with its own job inside) and had to be released in two steps whenever one of them changed. Now every job is in
@@ -33,15 +38,16 @@ from wfgen import Job, render_job, script, sub  # noqa: E402
 wfgen.set_root(ROOT)
 OUT = "service-publish.yaml"
 GITOPS_PIN = "platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0"
-NAMES = {"changes": "Guard: Changes", "image": "Image: Find or build", "scan": "Image: Scan", "publish": "Publish: Copy, sign, verify",
-         "sbom": "Publish: SBOM", "deploy": "Deploy: Open dev PR", "prune": "Cleanup: Prune staging"}
+# Job names: sentence case, what the job does, no group prefixes. In the caller's run GitHub shows them as `publish / <name>`.
+NAMES = {"changes": "Detect changes", "image": "Find or build image", "scan": "Scan image", "publish": "Publish image",
+         "sbom": "Create SBOM", "deploy": "Open dev PR", "prune": "Clean up staging images"}
 
 
 def name_of(key):
     return NAMES[key]
 
 
-# ───────────────────────── Guard: Changes ─────────────────────────
+# ───────────────────────── Detect changes ─────────────────────────
 
 def changes_job():
     j = Job("changed-paths.yaml", "detect")
@@ -65,11 +71,13 @@ def changes_job():
                   "                decide true \"the commit given as before is not available; assuming code\"\n"
                   "              fi\n"
                   "              [ -n \"$base\" ] || { git rev-parse --verify --quiet HEAD^1", src)
+    compare = sub(compare, '          skipped="Tests, scans and the image build are skipped."\n',
+                  '          skipped="Nothing is published."\n', src)
     return render_job("changes", name_of("changes"), [j.steps[0], compare], timeout=j.timeout(), perms=j.raw("permissions"),
                       outputs=j.raw("outputs"))
 
 
-# ───────────────────────── Image: Find or build, Image: Scan ─────────────────────────
+# ───────────────────────── Find or build image, Scan image ─────────────────────────
 
 def image_job():
     steps = [
@@ -80,6 +88,7 @@ def image_job():
         wfgen.find_step("true"),
         wfgen.build_step(push="true", cache_write=True),
         wfgen.record_step("true"),
+        wfgen.summary_step(scan=False),
     ]
     outputs = ("    outputs:\n"
                "      tree: ${{ steps.find.outputs.tree }}\n"
@@ -92,6 +101,20 @@ def image_job():
                       cond="${{ needs.changes.outputs.code == 'true' && github.ref == 'refs/heads/main' }}")
 
 
+SCAN_SUMMARY_SCRIPT = r"""
+set -euo pipefail
+{
+  echo "### Image scan"
+  echo
+  case "$SCAN" in
+    success) echo "Trivy found no HIGH or CRITICAL vulnerabilities in \`$DIGEST\`." ;;
+    failure) echo "**Trivy failed** on \`$DIGEST\`: HIGH or CRITICAL vulnerabilities, or the scan could not run. The table is in the log of the step \"Run Trivy vulnerability scanner\". Nothing is published." ;;
+    *) echo "Trivy did not run." ;;
+  esac
+} >> "$GITHUB_STEP_SUMMARY"
+"""
+
+
 def scan_job():
     first, rest = wfgen.checkout_step().split("\n", 1)
     steps = [
@@ -100,12 +123,18 @@ def scan_job():
         wfgen.login_step("Log in to ghcr.io"),
         wfgen.trivy_step("${{ needs.image.outputs.ref }}",
                          "same version, threshold and ignore file as the image job of service-ci-<language>; new CVEs may have appeared since the pull request"),
+        ("      - name: Write the run summary\n"
+         "        if: ${{ !cancelled() }}\n"
+         "        env:\n"
+         "          DIGEST: ${{ needs.image.outputs.digest }}\n"
+         "          SCAN: ${{ steps.trivy.outcome }}\n"
+         "        run: |\n" + script(SCAN_SUMMARY_SCRIPT)),
     ]
     perms = "    permissions:\n      contents: read\n      packages: read"
     return render_job("scan", name_of("scan"), steps, timeout=15, perms=perms, needs=["image"])
 
 
-# ───────────────────────── Publish: Copy, sign, verify ─────────────────────────
+# ───────────────────────── Publish image ─────────────────────────
 
 COPY_SCRIPT = r"""
 set -euo pipefail
@@ -170,21 +199,27 @@ fi
 """
 
 SUMMARY_SCRIPT = r"""
+set -euo pipefail
+short=${GITHUB_SHA:0:7}
+# The names come from the caller's file; they are only printed (and made into a link) when they are plain names.
+helm="the pull request in platform-demo-helm that moves the environment to this digest"
+if [[ "$APP" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && [[ "$TARGET_ENV" =~ ^[a-z][a-z0-9-]*$ ]]; then
+  helm="[the pull request in platform-demo-helm that moves \`$TARGET_ENV\` of \`$APP\` to this digest]($HELM_URL/pulls?q=is%3Apr+head%3Apromote%2F$APP%2F$TARGET_ENV), opened by the \`Open dev PR\` job (its summary links the exact one)"
+fi
 {
-  echo "### Published"
+  echo "### Published \`$TAG\`"
   echo
   echo "| | |"
   echo "|---|---|"
-  echo "| commit | \`$GITHUB_SHA\` |"
-  echo "| source tree | \`$TREE\` |"
-  case "$HOW" in
-    reused) echo "| image | **reused**: the build of this tree from the pull request, not built again |" ;;
-    *) echo "| image | **built** here (no image of this tree existed) |" ;;
-  esac
-  echo "| digest | \`$DIGEST\` |"
+  echo "| Commit | [\`$short\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) |"
   echo "| Docker Hub tag | \`$TAG\` |"
-  echo "| signature | verified (keyless, identity: this workflow, certificate names commit \`${GITHUB_SHA:0:7}\`) |"
-  echo "| helm pull request | [open promotions of \`$APP\` to \`$TARGET_ENV\`]($HELM_URL/pulls?q=is%3Apr+head%3Apromote%2F$APP%2F$TARGET_ENV); the exact link is in the \"Deploy: Open dev PR\" summary |"
+  echo "| Digest | \`$DIGEST\` |"
+  case "$HOW" in
+    reused) echo "| Image | reused: built by the pull request from source tree \`$TREE\`, not built again |" ;;
+    *) echo "| Image | built in this run from source tree \`$TREE\` (no image of this tree existed) |" ;;
+  esac
+  echo "| Signature | verified (keyless cosign; the certificate names this workflow and commit \`$short\`) |"
+  echo "| Dev change | $helm |"
 } >> "$GITHUB_STEP_SUMMARY"
 """
 
@@ -200,7 +235,7 @@ def publish_job():
             "          SOURCE_DIGEST: ${{ needs.image.outputs.digest }}\n"
             "          HUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name || inputs.app }}\n"
             "        run: |\n" + script(COPY_SCRIPT))
-    summary = ("      - name: Summary\n"
+    summary = ("      - name: Write the run summary\n"
                "        env:\n"
                "          TREE: ${{ needs.image.outputs.tree }}\n"
                "          HOW: ${{ needs.image.outputs.how }}\n"
@@ -231,7 +266,16 @@ def publish_job():
     return render_job("publish", name_of("publish"), steps, timeout=d.timeout(), perms=perms, needs=["image", "scan"], outputs=outputs)
 
 
-# ───────────────────────── Publish: SBOM ─────────────────────────
+# ───────────────────────── Create SBOM ─────────────────────────
+
+SBOM_SUMMARY_SCRIPT = r"""
+{
+  echo "### SBOM"
+  echo
+  echo "An SPDX SBOM is attached to \`$DIGEST\` as a signed attestation, and the attestation was verified."
+} >> "$GITHUB_STEP_SUMMARY"
+"""
+
 
 def sbom_job():
     d = Job("docker-promote.yaml", "promote")
@@ -245,12 +289,16 @@ def sbom_job():
     moved = []
     for title in ("Generate SBOM", "Attach SBOM to image as a signed attestation", "Verify the SBOM attestation we just made"):
         moved.append(sub(d.step(title), "steps.promote.outputs.ref", "steps.published.outputs.ref", f"{d.src}: {title}", count=1))
-    steps = [d.step("Log in to Docker Hub"), ref, d.step("Install Cosign")] + moved
+    summary = ("      - name: Write the run summary\n"
+               "        env:\n"
+               "          DIGEST: ${{ needs.publish.outputs.digest }}\n"
+               "        run: |\n" + script(SBOM_SUMMARY_SCRIPT))
+    steps = [d.step("Log in to Docker Hub"), ref, d.step("Install Cosign")] + moved + [summary]
     perms = "    permissions:\n      id-token: write # keyless cosign attestation\n      contents: read"
     return render_job("sbom", name_of("sbom"), steps, timeout=15, perms=perms, needs=["publish"])
 
 
-# ───────────────────────── Deploy: Open dev PR ─────────────────────────
+# ───────────────────────── Open dev PR ─────────────────────────
 
 def deploy_job():
     return f"""\
@@ -275,7 +323,27 @@ def deploy_job():
 """
 
 
-# ───────────────────────── Cleanup: Prune staging ─────────────────────────
+# ───────────────────────── Clean up staging images ─────────────────────────
+
+PRUNE_SUMMARY = '''
+def plain(text):                             # tags come from the registry: plain characters only inside the table
+    return re.sub(r"[^A-Za-z0-9._,:@/ +-]", "?", str(text))
+
+
+with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+    s.write(f"### Clean up staging images{' (dry run)' if dry_run else ''}\\n\\n")
+    handled = len(todo) if dry_run else deleted
+    s.write(f"`ghcr.io/{owner}/{package}` had {len(versions)} versions; {'would delete' if dry_run else 'deleted'} {handled}, "
+            f"{len(versions) - handled} {'would remain' if dry_run else 'remain'}"
+            f"{'; ' + str(failures) + ' deletion(s) failed, see the log' if failures else ''}"
+            f"{'; more qualify, the next run continues' if truncated else ''}.\\n")
+    if todo:
+        s.write(f"\\n<details><summary>{'Versions that would be deleted' if dry_run else 'Versions selected for deletion'} ({len(todo)})</summary>\\n\\n")
+        s.write("| Version | Digest | Created | Tags | Reason |\\n|---|---|---|---|---|\\n")
+        for v, reason in todo:
+            s.write(f"| {v['id']} | `{plain(v['name'][:19])}` | {v['_created']:%Y-%m-%d} | {plain(','.join(v['_tags']) or '-')} | {reason} |\\n")
+        s.write("\\n</details>\\n")
+'''
 
 def prune_job():
     j = Job("ghcr-prune.yaml", "prune")
@@ -324,7 +392,34 @@ anchors = kept + [v for v in versions if protected(v) and v not in kept]   # the
     step = sub(step, 'die("no sha-* tagged version to keep; refusing to delete anything (is the tag format still sha-<commit>?)")',
                'die("no sha-* or tree-* tagged version to keep; refusing to delete anything (did the tag format change?)")', src)
     step = sub(step, 'f"older than the newest {keep} sha-* versions"', 'f"older than the newest of its tag family (keeping {keep} sha-*, {keep_tree} tree-*)"', src)
-    step = sub(step, "{len(kept)} newest sha-* kept;", "{len(kept)} newest kept;", src)
+    # the run summary: counts first, the table of what was handled folded away, registry text reduced to plain characters
+    step = sub(step, ind('''
+failures = 0
+for v, reason in todo:
+'''), ind('''
+failures = 0
+deleted = 0
+for v, reason in todo:
+'''), src)
+    step = sub(step, ind('''
+    r = gh("api", "-X", "DELETE", f"{api}/{v['id']}", check=False)
+    if r.returncode != 0:
+'''), ind('''
+    r = gh("api", "-X", "DELETE", f"{api}/{v['id']}", check=False)
+    if r.returncode == 0:
+        deleted += 1
+    if r.returncode != 0:
+'''), src)
+    step = sub(step, ind('''
+with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+    s.write(f"### ghcr.io/{owner}/{package} {'(dry run)' if dry_run else ''}\\n\\n")
+    s.write(f"{len(versions)} versions; {len(kept)} newest sha-* kept; {len(todo)} {'would be deleted' if dry_run else 'deleted'}"
+            f"{' (limit reached, the next run continues)' if truncated else ''}.\\n\\n")
+    if todo:
+        s.write("| Version | Digest | Created | Tags | Reason |\\n|---|---|---|---|---|\\n")
+        for v, reason in todo:
+            s.write(f"| {v['id']} | `{v['name'][:19]}` | {v['_created']:%Y-%m-%d} | {','.join(v['_tags']) or '-'} | {reason} |\\n")
+'''), ind(PRUNE_SUMMARY), src)
     env = j.raw("env")
     env = sub(env, "      PACKAGE: ${{ inputs.package }}", "      PACKAGE: ${{ github.event.repository.name }}", j.src)
     env = sub(env, "      KEEP: ${{ inputs.keep }}", "      KEEP: ${{ inputs.prune-keep }}\n      KEEP_TREE: ${{ inputs.prune-keep-tree }}", j.src)
@@ -347,21 +442,25 @@ name: Service publish
 #
 # The merge-to-main pipeline of every app repository, ONE flat workflow (no nested publish boxes in the Actions graph):
 #
-#   Guard: Changes -> Image: Find or build -> Image: Scan -> Publish: Copy, sign, verify -+-> Publish: SBOM
-#                                                                                         +-> Deploy: Open dev PR
-#                                                                                         +-> Cleanup: Prune staging
+#   Detect changes -> Find or build image -> Scan image -> Publish image -+-> Create SBOM
+#                                                                         +-> Open dev PR
+#                                                                         +-> Clean up staging images
 #
-#   Guard: Changes              a docs/metadata-only commit publishes nothing (a manual run with `before` diffs before..HEAD like a push)
-#   Image: Find or build        the image of this commit's source tree: ghcr.io/<repo>:tree-<git tree hash>. FOUND (the pull request built
-#                               it, main did not move) = reused, no build. NOT FOUND (the tree differs, or the image was pruned) = built now,
-#                               the registry build cache is written, pushed under the same tag so a re-run finds it
-#   Image: Scan                 Trivy on that exact digest, again (new CVEs may have appeared since the pull request)
-#   Publish: Copy, sign, verify copy that digest to Docker Hub as sha-<7 chars of the commit> ONLY (no latest, no semver; a digest that
-#                               differs from the scanned one fails the run), cosign sign (keyless), verify; refuses commits not reachable from main
-#   Publish: SBOM               SBOM attestation, signed, verified; next to the helm pull request, not before it; a failure fails the run
-#   Deploy: Open dev PR         the pull request in the helm repository that moves env `dev` to this digest (gitops-promote.yaml, unchanged)
-#   Cleanup: Prune staging      best effort (the job may fail without failing the run): keep the newest `prune-keep` (10) `sha-*` and `prune-keep-tree` (20) `tree-*` versions of
-#                               the ghcr.io package, never the buildcache package, never an image-index child of a kept image
+#   Detect changes        a docs/metadata-only commit publishes nothing (a manual run with `before` diffs before..HEAD like a push)
+#   Find or build image   the image of this commit's source tree: ghcr.io/<repo>:tree-<git tree hash>. FOUND (the pull request built
+#                         it, main did not move) = reused, no build. NOT FOUND (the tree differs, or the image was pruned) = built now,
+#                         the registry build cache is written, pushed under the same tag so a re-run finds it
+#   Scan image            Trivy on that exact digest, again (new CVEs may have appeared since the pull request)
+#   Publish image         copy that digest to Docker Hub as sha-<7 chars of the commit> ONLY (no latest, no semver; a digest that
+#                         differs from the scanned one fails the run), cosign sign (keyless), verify; refuses commits not reachable from main
+#   Create SBOM           SBOM attestation, signed, verified; next to the helm pull request, not before it; a failure fails the run
+#   Open dev PR           the pull request in the helm repository that moves env `dev` to this digest (gitops-promote.yaml, unchanged)
+#   Clean up staging images   best effort (the job may fail without failing the run): keep the newest `prune-keep` (10) `sha-*` and
+#                         `prune-keep-tree` (20) `tree-*` versions of the ghcr.io package, never the buildcache package, never an
+#                         image-index child of a kept image
+#
+# Each job writes its own short section of the run summary; `Publish image` carries the answer to "what was published": the Docker Hub
+# tag, the commit, the digest, the signature and where the dev change goes. In the caller's run the checks are named `publish / <name>`.
 # Release tags and `latest` are not made here: a version is chosen when the digest is promoted to stage/prod in the helm repository.
 #
 # Concurrency (in the caller, group `publish-<ref>`, no cancel) runs one publish at a time. A run waiting behind a running one is
