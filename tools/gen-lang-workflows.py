@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Generate node-ci, python-ci, java-gradle-ci, dotnet-ci reusable workflows into <workflows-repo>/.github/workflows"""
+"""Generate node-ci, python-ci, java-gradle-ci, dotnet-ci and secret-scan, and splice the secret-scan job into go-ci.
+
+usage: gen-lang-workflows.py <workflows-repo>     (writes <workflows-repo>/.github/workflows/*.yaml)
+
+The secret scan is written ONCE here (SECRET_SCAN_STEPS) and used by secret-scan.yaml (stand-alone / service-ci) and by every
+language workflow (kept inside them for callers that still call a language workflow directly; service-ci turns it off with
+`secret-scan: false` and runs one scan itself). tools/check-consistency.py fails when a generated file is out of date.
+"""
 import os, sys, textwrap
 out = os.path.join(sys.argv[1], ".github", "workflows")
 
@@ -27,42 +34,72 @@ def co(fetch_all=False):
     fetch-depth: 0 # full history so gitleaks scans every commit
     persist-credentials: false"""
 
-def job(key, name, body, needs=None, perms="contents: read", extra="", cond=""):
+# Every job has a timeout (a hung job otherwise burns the 6-hour default of a free-plan runner).
+TIMEOUT = {"lint-format": 15, "secret-scan": 10, "build-check": 15, "unit-tests": 20, "sca": 15, "sast": 15, "smoke-test": 10}
+
+def job(key, name, body, needs=None, perms="contents: read", extra="", cond="", timeout=None):
     n = f"    needs: [{', '.join(needs)}]\n" if needs else ""
     c = f"    if: {cond}\n" if cond else ""
+    t = timeout or TIMEOUT[key]
     p = "".join(f"      {l.strip()}\n" for l in perms.split(";"))
     return f"""
   {key}:
     name: {name}
 {c}    runs-on: ubuntu-latest
+    timeout-minutes: {t}
 {n}    permissions:
 {p}{extra}    steps:
 {body}"""
 
-def secret_scan():
-    return job("secret-scan", "Secret Scan", steps(co(True), f"""
+# The one secret-scan implementation. Pull requests: the checkout is the merge commit (parents = base tip and PR head), depth 2,
+# then history is deepened only until the PR's range BASE..HEAD is complete. Manual runs: the whole history, as before.
+SECRET_SCAN_STEPS = r"""
+- uses: __CHECKOUT__
+  with:
+    # pull request: depth 2 is enough to reach both parents of the merge commit; anything else (manual run): full history
+    fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+    persist-credentials: false
+
 - name: Install gitleaks
   env:
     GITLEAKS_VERSION: "8.30.1"
     GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
   run: |
-    curl -fsSL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${{GITLEAKS_VERSION}}/gitleaks_${{GITLEAKS_VERSION}}_linux_x64.tar.gz"
-    echo "${{GITLEAKS_SHA256}}  gitleaks.tgz" | sha256sum -c -
+    curl -fsSL --retry 3 --retry-all-errors -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+    echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum -c -
     tar -xzf gitleaks.tgz gitleaks
     sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
 
 - name: Run gitleaks
   env:
-    BASE_SHA: ${{{{ github.event.pull_request.base.sha }}}}
-    HEAD_SHA: ${{{{ github.event.pull_request.head.sha }}}}
+    BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    HEAD_SHA: ${{ github.event.pull_request.head.sha }}
   run: |
     # the open-source CLI, not gitleaks-action: the Action needs a paid license in organisation-owned repositories
     if [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
-      gitleaks git --redact --verbose --log-opts="${{BASE_SHA}}..${{HEAD_SHA}}"   # the pull request's commits
+      # Pull request: scan only its commits (BASE..HEAD) without cloning the whole history. Make sure both ends exist, then
+      # deepen until they share an ancestor (the range is then complete); give up and fetch everything after 10 rounds.
+      for sha in "$BASE_SHA" "$HEAD_SHA"; do
+        git cat-file -e "${sha}^{commit}" 2>/dev/null || git fetch --no-tags --depth=2 origin "$sha"
+      done
+      rounds=0
+      until git merge-base "$BASE_SHA" "$HEAD_SHA" > /dev/null 2>&1; do
+        rounds=$((rounds + 1))
+        if [ "$rounds" -gt 10 ]; then
+          git fetch --no-tags --unshallow origin || true
+          break
+        fi
+        git fetch --no-tags --deepen=50 origin "$BASE_SHA" "$HEAD_SHA"
+      done
+      gitleaks git --redact --verbose --log-opts="${BASE_SHA}..${HEAD_SHA}"   # the pull request's commits
     else
       gitleaks git --redact --verbose                                           # manual run: the whole history
     fi
-"""), perms="contents: read")
+"""
+
+def secret_scan(cond="inputs.secret-scan"):
+    return job("secret-scan", "Secret Scan", steps(SECRET_SCAN_STEPS.replace("__CHECKOUT__", CHECKOUT)),
+               perms="contents: read", cond=cond)
 
 def semgrep(inputname="semgrep-config"):
     return job("sast", "SAST - Static Security Analysis", steps(co(), f"""
@@ -85,9 +122,13 @@ def semgrep(inputname="semgrep-config"):
       args+=(--config "$rule")
     done
     semgrep scan "${{args[@]}}" --error --metrics=off
-"""), needs=STAGE1)
+"""))
 
-STAGE1 = ["lint-format", "secret-scan", "build-check", "unit-tests"]
+SECRET_INPUT = """      secret-scan:
+        description: Run the Secret Scan job in this workflow. service-ci sets it to false because it runs one scan for every language itself.
+        type: boolean
+        default: true
+"""
 
 def header(name, desc, inputs, secrets=False):
     sec = """    secrets:
@@ -102,7 +143,7 @@ def header(name, desc, inputs, secrets=False):
 on:
   workflow_call:
     inputs:
-{inputs}{sec}
+{inputs}{SECRET_INPUT}{sec}
 # Least privilege by default; every job below declares what it needs.
 permissions: {{}}
 
@@ -162,12 +203,12 @@ node += job("lint-format", "Lint & Format", steps(co(), NODE_SETUP, """
 node += secret_scan()
 node += job("build-check", "Build Check", steps(co(), NODE_SETUP, "- name: Build\n  run: npm run build"))
 node += job("unit-tests", "Unit Tests", steps(co(), NODE_SETUP, "- name: Run unit tests\n  run: npm run test:ci"))
-node += "\n  # ─── STAGE 2 (parallel) ───────────────────────────────────────────────────\n"
+node += "\n  # ─── security scans (all jobs run in parallel) ────────────────────────────\n"
 node += job("sca", "SCA - Dependency Vulnerabilities", steps(co(), NODE_SETUP, """
 - name: Run npm audit
   # audit-level=high: fail only on high/critical findings
   run: npm audit --audit-level=high --omit=dev
-"""), needs=STAGE1)
+"""))
 node += semgrep()
 node += job("smoke-test", "Smoke Test (gRPC health)", steps(co(), NODE_SETUP, "- name: Build server\n  run: npm run build", """
 - name: Install grpcurl
@@ -203,7 +244,7 @@ node += job("smoke-test", "Smoke Test (gRPC health)", steps(co(), NODE_SETUP, "-
     if [ -n "$SMOKE_SCRIPT" ]; then
       bash "$SMOKE_SCRIPT"
     fi
-"""), needs=STAGE1, cond="inputs.smoke-port != ''")
+"""), cond="inputs.smoke-port != ''")
 write("node-ci.yaml", node)
 
 # ───────────────────────────── python ─────────────────────────────
@@ -272,7 +313,7 @@ py += job("unit-tests", "Unit Tests", steps(co(), PY_SETUP, """
     TESTS_PATH: ${{ inputs.tests-path }}
   run: pytest "$TESTS_PATH" -v --tb=short
 """))
-py += "\n  # ─── STAGE 2 (parallel) ───────────────────────────────────────────────────\n"
+py += "\n  # ─── security scans (all jobs run in parallel) ────────────────────────────\n"
 py += job("sca", "SCA - Dependency Vulnerabilities", steps(co(), PY_SETUP, """
 - name: Install pip-audit
   env:
@@ -281,7 +322,7 @@ py += job("sca", "SCA - Dependency Vulnerabilities", steps(co(), PY_SETUP, """
 
 - name: Run pip-audit
   run: pip-audit -r requirements.txt
-"""), needs=STAGE1)
+"""))
 py += job("sast", "SAST - Static Security Analysis", steps(co(), PY_SETUP, """
 - name: Install bandit
   env:
@@ -293,7 +334,7 @@ py += job("sast", "SAST - Static Security Analysis", steps(co(), PY_SETUP, """
     SOURCE_DIR: ${{ inputs.source-dir }}
     BANDIT_CONFIG: ${{ inputs.bandit-config }}
   run: bandit -r "$SOURCE_DIR" -c "$BANDIT_CONFIG"
-"""), needs=STAGE1)
+"""))
 write("python-ci.yaml", py)
 
 # ───────────────────────────── java (gradle) ─────────────────────────────
@@ -329,7 +370,7 @@ java += job("unit-tests", "Unit Tests", steps(co(), JAVA_SETUP, "- name: Run uni
     name: test-results
     path: build/reports/tests/test/
 """))
-java += "\n  # ─── STAGE 2 (parallel) ───────────────────────────────────────────────────\n"
+java += "\n  # ─── security scans (all jobs run in parallel) ────────────────────────────\n"
 java += job("sca", "SCA - Dependency Vulnerabilities", steps(co(), f"""
 - name: Run Trivy filesystem vulnerability scan
   uses: {SHA['trivy']}
@@ -339,7 +380,9 @@ java += job("sca", "SCA - Dependency Vulnerabilities", steps(co(), f"""
     scanners: vuln
     severity: CRITICAL,HIGH
     exit-code: 1
-"""), needs=STAGE1)
+    # Trivy itself (the action's default is older): bump here, in one reviewed place.
+    version: v0.76.1
+"""))
 java += semgrep()
 write("java-gradle-ci.yaml", java)
 
@@ -416,7 +459,7 @@ dn += job("unit-tests", "Unit Tests", steps(co(), DN_SETUP, """
     path: test-results/unit-test-results.trx
     reporter: dotnet-trx
 """), perms="contents: read;checks: write # test-reporter publishes a check run")
-dn += "\n  # ─── STAGE 2 (parallel) ───────────────────────────────────────────────────\n"
+dn += "\n  # ─── security scans (all jobs run in parallel) ────────────────────────────\n"
 dn += job("sca", "SCA - Dependency Vulnerabilities", steps(co(), DN_SETUP, """
 - name: Restore dependencies
   env:
@@ -434,6 +477,33 @@ dn += job("sca", "SCA - Dependency Vulnerabilities", steps(co(), DN_SETUP, """
       exit 1
     fi
     echo "PASS: no vulnerable packages found"
-"""), needs=STAGE1)
+"""))
 dn += semgrep()
 write("dotnet-ci.yaml", dn)
+
+# ───────────────────────────── stand-alone secret scan + go-ci ─────────────────────────────
+write("secret-scan.yaml", f"""name: Secret scan
+
+# Gitleaks scan of a pull request's commits (full history on manual runs). Used by service-ci for every service and by the
+# repositories that have no language pipeline (Helm charts, compose files, docs). GENERATED by tools/gen-lang-workflows.py:
+# the same steps are inside every language workflow (input `secret-scan`), so edit the generator, not this file.
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/secret-scan.yaml@<sha> # <tag>
+
+on:
+  workflow_call:
+
+permissions: {{}}
+
+jobs:{secret_scan(cond="")}""")
+
+import re
+gp = os.path.join(out, "go-ci.yaml")
+go = open(gp).read()
+begin, end = "  # BEGIN generated: secret-scan (tools/gen-lang-workflows.py)\n", "  # END generated: secret-scan\n"
+new_job = secret_scan().lstrip("\n").rstrip("\n") + "\n"
+if begin in go:
+    go = re.sub(re.escape(begin) + ".*?" + re.escape(end), lambda m: begin + new_job + end, go, flags=re.S)
+    open(gp, "w").write(go)
+    print("spliced secret-scan into go-ci.yaml")
+else:
+    sys.exit("go-ci.yaml has no BEGIN/END generated: secret-scan markers")

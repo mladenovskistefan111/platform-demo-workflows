@@ -28,6 +28,10 @@ on:
       semgrep-version:
         type: string
         default: 1.180.0
+      secret-scan:
+        description: Run the Secret Scan job in this workflow. service-ci sets it to false because it runs one scan for every language itself.
+        type: boolean
+        default: true
 
 # Least privilege by default; every job below declares what it needs.
 permissions: {}
@@ -36,6 +40,7 @@ jobs:
   lint-format:
     name: Lint & Format
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -60,13 +65,16 @@ jobs:
 
   secret-scan:
     name: Secret Scan
+    if: inputs.secret-scan
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0 # full history so gitleaks scans every commit
+          # pull request: depth 2 is enough to reach both parents of the merge commit; anything else (manual run): full history
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
           persist-credentials: false
 
       - name: Install gitleaks
@@ -74,7 +82,7 @@ jobs:
           GITLEAKS_VERSION: "8.30.1"
           GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
         run: |
-          curl -fsSL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 --retry-all-errors -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum -c -
           tar -xzf gitleaks.tgz gitleaks
           sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
@@ -86,6 +94,20 @@ jobs:
         run: |
           # the open-source CLI, not gitleaks-action: the Action needs a paid license in organisation-owned repositories
           if [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
+            # Pull request: scan only its commits (BASE..HEAD) without cloning the whole history. Make sure both ends exist, then
+            # deepen until they share an ancestor (the range is then complete); give up and fetch everything after 10 rounds.
+            for sha in "$BASE_SHA" "$HEAD_SHA"; do
+              git cat-file -e "${sha}^{commit}" 2>/dev/null || git fetch --no-tags --depth=2 origin "$sha"
+            done
+            rounds=0
+            until git merge-base "$BASE_SHA" "$HEAD_SHA" > /dev/null 2>&1; do
+              rounds=$((rounds + 1))
+              if [ "$rounds" -gt 10 ]; then
+                git fetch --no-tags --unshallow origin || true
+                break
+              fi
+              git fetch --no-tags --deepen=50 origin "$BASE_SHA" "$HEAD_SHA"
+            done
             gitleaks git --redact --verbose --log-opts="${BASE_SHA}..${HEAD_SHA}"   # the pull request's commits
           else
             gitleaks git --redact --verbose                                           # manual run: the whole history
@@ -94,6 +116,7 @@ jobs:
   build-check:
     name: Build Check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -113,6 +136,7 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       checks: write # test-reporter publishes a check run
@@ -150,12 +174,12 @@ jobs:
           path: test-results/unit-test-results.trx
           reporter: dotnet-trx
 
-  # ─── STAGE 2 (parallel) ───────────────────────────────────────────────────
+  # ─── security scans (all jobs run in parallel) ────────────────────────────
 
   sca:
     name: SCA - Dependency Vulnerabilities
     runs-on: ubuntu-latest
-    needs: [lint-format, secret-scan, build-check, unit-tests]
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -187,7 +211,7 @@ jobs:
   sast:
     name: SAST - Static Security Analysis
     runs-on: ubuntu-latest
-    needs: [lint-format, secret-scan, build-check, unit-tests]
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
