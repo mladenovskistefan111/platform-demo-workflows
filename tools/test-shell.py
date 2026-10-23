@@ -8,7 +8,8 @@ jq, python3 and PyYAML.  usage: tools/test-shell.py [repo-dir]      exit 1 and o
   * change detection with `before` (service-publish: push, workflow_dispatch with and without before)
   * the main-reachability check
   * prune selection (sha-* and tree-* families, protected tags, image-index children) with fake package JSON
-  * the merge job of ci.yaml (approval check, branch-moved check, merge, `before`, starting Publish) with a stubbed gh
+  * service-merge.yaml, the merge button (approval check, branch-moved check, merge, `before`, starting Publish) with a stubbed gh, and
+    the short caller job that calls it
   * the release tag button (version check, existing tag, annotated tag on the commit)
 """
 import hashlib, json, os, shutil, stat, subprocess, sys, tempfile, textwrap
@@ -413,7 +414,7 @@ def prune_run(versions, manifests, env_extra=None, delete_fails=()):
     open(os.path.join(e.dir, "delete-fails"), "w").write("\n".join(str(x) for x in delete_fails))
     for d, doc in manifests.items():
         json.dump(doc, open(os.path.join(e.dir, f"manifest-{d.replace(':', '_')}.json"), "w"))
-    env_ = {"GH_TOKEN": "tok", "OWNER": "Plat-Form", "PACKAGE": "app-thing", "KEEP": "2", "UNTAGGED_DAYS": "7", "DRY_RUN": "false"}
+    env_ = {"GH_TOKEN": "tok", "OWNER": "Plat-Form", "PACKAGE": "app-thing", "KEEP": "2", "KEEP_TREE": "2", "UNTAGGED_DAYS": "7", "DRY_RUN": "false"}
     env_.update(env_extra or {})
     rc, out = e.run(PRUNE, env_)
     deleted = sorted(int(c.rsplit("/", 1)[1]) for c in e.calls() if c.startswith("gh api -X DELETE"))
@@ -442,6 +443,14 @@ e, rc, out, deleted = prune_run(versions2, m2_)
 check("prune: a version with a sha- tag that is too old but a tree- tag that is among the newest is kept", rc == 0 and deleted == [1, 2], f"rc={rc} deleted={deleted}\n{out}")
 e.done()
 
+more = {**manifests, **{v["name"]: idx([]) for v in versions if v["id"] in (2, 3, 13)}}
+e, rc, out, deleted = prune_run(versions, more, {"KEEP": "4", "KEEP_TREE": "3"})
+check("prune: separate N per family (4 sha-*, 3 tree-*)", rc == 0 and deleted == [1, 11, 12, 32], f"rc={rc} deleted={deleted}\n{out}")
+e.done()
+e, rc, out, deleted = prune_run(versions, manifests, {"KEEP_TREE": "0"})
+check("prune: keep-tree below 1 is refused", rc != 0 and deleted == [] and "at least 1" in out, f"rc={rc} deleted={deleted}\n{out}")
+e.done()
+
 e, rc, out, deleted = prune_run(versions, manifests, {"DRY_RUN": "true"})
 check("prune: dry run deletes nothing and says what it would", rc == 0 and deleted == [] and "WOULD DELETE" in out, f"rc={rc} deleted={deleted}\n{out}")
 e.done()
@@ -467,7 +476,7 @@ e.done()
 check("prune: the job is best effort and runs next to the helm pull request", pub["jobs"]["prune"]["continue-on-error"] is True
       and pub["jobs"]["deploy"]["needs"] == ["publish"] and pub["jobs"]["prune"]["needs"] == ["publish"])
 
-# ───────────────────────── the merge job ─────────────────────────
+# ───────────────────────── the merge button (service-merge.yaml) ─────────────────────────
 GH_MERGE_STUB = r'''#!/usr/bin/env python3
 import json, os, subprocess, sys
 d = os.environ["STUB_DIR"]
@@ -532,16 +541,23 @@ def pr_state(e):
     return json.load(open(os.path.join(e.dir, "state.json")))["pr"]["state"]
 
 
+# the callers: a short job that calls service-merge.yaml (Publish is started everywhere except in the repository without an image pipeline)
 for svc in ("checkout-service", "product-catalog-db"):
     tmpd = tempfile.mkdtemp(prefix="test-callers-")
     subprocess.run([sys.executable, os.path.join(ROOT, "tools", "gen-callers.py"), tmpd, svc, "0" * 40, "v0.0.0"], check=True, capture_output=True)
-    ci = yaml.safe_load(open(os.path.join(tmpd, ".github/workflows/ci.yaml")))
+    text = open(os.path.join(tmpd, ".github/workflows/ci.yaml")).read()
+    cj = yaml.safe_load(text)["jobs"]["merge"]
     shutil.rmtree(tmpd, ignore_errors=True)
-    mj = ci["jobs"]["merge"]
-    approve, merge = step(mj, "name", "Check that the environment was approved")["run"], step(mj, "id", "merge")["run"]
-    publish = next((s["run"] for s in mj["steps"] if s.get("name") == "Start Publish"), None)
-    check(f"merge[{svc}]: Publish is started only where publish.yaml exists", (publish is not None) == (svc != "product-catalog-db"))
+    check(f"merge caller[{svc}]: a short job that calls service-merge.yaml", cj["uses"].endswith("/service-merge.yaml@" + "0" * 40) and cj["needs"] == "ci"
+          and "steps" not in cj and len(text.splitlines()) < 60, f"{cj} {len(text.splitlines())} lines")
+    check(f"merge caller[{svc}]: Publish is started only where publish.yaml exists", (cj.get("with") or {}).get("start-publish", True) == (svc != "product-catalog-db"))
 
+mw = load("service-merge.yaml")
+for svc in ("service-merge",):
+    ci = mw
+    mj = mw["jobs"]["merge"]
+    approve, merge = step(mj, "name", "Check that the environment was approved")["run"], step(mj, "id", "merge")["run"]
+    publish = step(mj, "name", "Start Publish")["run"]
     e, env_ = merge_setup(ci)
     rc, out = e.run(approve, env_)
     check(f"merge[{svc}]: approved environment passes", rc == 0, f"rc={rc} {out}")

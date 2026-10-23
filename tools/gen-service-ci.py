@@ -207,7 +207,7 @@ def image_steps():
                                  "its failed login must not fail the pull request"),
         wfgen.cache_step(),
         wfgen.find_step("${{ steps.mode.outputs.push }}"),
-        wfgen.build_step(push="expr", cache_write=False),
+        wfgen.build_step(push="expr", cache_write="when-pushing"),
         wfgen.record_step("${{ steps.mode.outputs.push }}"),
         wfgen.trivy_step("${{ steps.image.outputs.ref }}",
                          "same version, threshold and ignore file as the scan in service-publish.yaml (which scans the same digest again)"),

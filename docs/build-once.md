@@ -23,7 +23,7 @@ commit but has the **same tree** when `main` did not move in between. So:
 | Publish, `Publish: Copy, sign, verify` | copy that digest by digest to Docker Hub as `sha-<7 chars of the main commit>` (no `latest`, no semver), cosign sign (keyless), verify; **a Docker Hub digest that differs from the scanned one fails the run**; an existing `sha-<7>` tag with another digest is never moved |
 
 **When the tree is not found:** another merge landed first (the tested merge result differs from what `main` became), the branch was
-rebased with other changes, the PR image was pruned (`prune-keep` newer `tree-*` versions exist), the pull request was from a fork or
+rebased with other changes, the PR image was pruned (more than `prune-keep-tree` newer `tree-*` versions exist), the pull request was from a fork or
 Dependabot, or the lookup itself failed (retried three times, then the image is built: building is always safe because what is built is
 what is scanned and shipped). The job summary says `reused` or `built`.
 
@@ -43,10 +43,9 @@ A re-run is cheap and consistent: the build pushed the tag, so the second run fi
 - **Trust boundary.** The image that ships can be built by a same-repository pull request's workflow run, which can push any `tree-*` tag
   of the package. Write access to the repository is therefore the trust boundary (forks cannot push). The publish scans and signs what it
   finds; it does not prove who built it. Fine for a solo or small trusted team; revisit before external contributors get write access.
-- **The registry build cache** (`ghcr.io/<repo>/buildcache`) is written only when the publish has to build. A pull request only reads it. If
-  nearly every merge reuses the PR image, the cache is not refreshed and PR builds work from an older cache; the first slow PR after a
-  long quiet time is the signal. Letting same-repository pull requests write the cache as well is a one-line change (`cache-to` in the build
-  step of the generator) if the cache goes stale in practice.
+- **The registry build cache** (`ghcr.io/<repo>/buildcache`, mode=max) is written by the publish when it builds and by every pull-request
+  run that pushes the image (same repository, not Dependabot), so the next build starts from the newest layers. Forks and Dependabot only
+  read it. A run that reuses an existing tree image builds nothing and writes nothing.
 - **A third merge replaces the pending one.** The caller's concurrency group `publish-<ref>` runs one publish at a time and keeps only the
   newest waiting run. The replaced run's tree is contained in the newest one, so it is published with it. Exception: if the replaced merge
   changed code and the last one is documentation-only, the last run's `before` is the replaced merge, the diff is docs-only and nothing is
@@ -56,14 +55,16 @@ A re-run is cheap and consistent: the build pushed the tag, so the second run fi
 ## Staging package on ghcr.io
 
 `ghcr.io/<repo>` holds `tree-<hash>` versions (and the older `sha-<commit>` versions of v3.3 and before). `Cleanup: Prune staging` keeps
-the newest N (input `prune-keep`, default 10) versions of **each** tag family, deletes the older ones and untagged versions older than seven
+the newest N versions of **each** tag family (`prune-keep`, default 10, for `sha-*`; `prune-keep-tree`, default 20, for `tree-*`: every pull-request push makes a version), deletes the older ones and untagged versions older than seven
 days, but never a version with another tag (`latest`, `v1.2.3`), never an untagged manifest that a kept image index points to (the
 attestations and platform manifests of a kept image) and never the `buildcache` package (a package name with a slash cannot be addressed).
 It runs next to the helm pull request, has `continue-on-error: true` and never delays or fails a publish. Docker Hub is not pruned here.
 
 ## The merge button
 
-`ci.yaml` of every app repository ends with a `merge` job (after `ci / gate`, not part of it):
+`ci.yaml` of every app repository ends with a `merge` job (after `ci / gate`, not part of it): a short `uses:` job that calls
+`service-merge.yaml`, where the logic lives once. The caller keeps the `if:` (same-repository pull request, not Dependabot) and grants
+`contents`, `pull-requests` and `actions: write`; the called job sits in the environment `merge`. The job:
 
 1. runs only for same-repository pull requests, in the environment `merge` (the owner is the required reviewer): on the run page,
    **Review deployments, Approve and deploy**;

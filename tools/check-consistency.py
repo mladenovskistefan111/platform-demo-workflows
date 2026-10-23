@@ -19,7 +19,9 @@
    - the image job: job id `image`, permissions contents read + packages write, and the steps it shares with service-publish (the
      tree lookup, the build labels, the digest record, the Trivy scan) are the same text as there;
 4. each stand-alone language workflow has the `secret-scan` input;
-5. service-publish.yaml (flat, generated): the job graph is Guard: Changes -> Image: Find or build -> Image: Scan -> Publish: Copy, sign,
+5. service-merge.yaml (the merge button called by every ci.yaml): one job in the environment `merge`, approval check first, no action;
+   the registry build cache is written by publish and by pull-request runs that push; prune has separate N for `sha-*` and `tree-*`;
+   service-publish.yaml (flat, generated): the job graph is Guard: Changes -> Image: Find or build -> Image: Scan -> Publish: Copy, sign,
    verify -> (Publish: SBOM | Deploy: Open dev PR | Cleanup: Prune staging); the only nested workflow is gitops-promote.yaml at the
    pinned commit that already exists (a sibling reference needs an existing SHA), the prune job is best effort
    (`continue-on-error`) and never waits for or blocks the helm pull request, the SBOM job is not on the way to it, no job output
@@ -280,6 +282,40 @@ if tb and tb[0]["with"]["image-ref"] != "${{ needs.image.outputs.ref }}":
 for action, sha in pin.findall(pub_text):
     if action in pins and sha not in pins[action]:
         problems.append(f"service-publish.yaml: {action}@{sha[:7]} is not the pin the other workflows use")
+# prune: separate N per tag family (every pull-request push makes a tree- version)
+pins_ = pub["on"]["workflow_call"]["inputs"]
+for name_, default_ in (("prune-keep", 10), ("prune-keep-tree", 20)):
+    if pins_.get(name_, {}).get("default") != default_ or pins_[name_].get("type") != "number":
+        problems.append(f"service-publish.yaml: input {name_} must be a number with default {default_}")
+if "KEEP_TREE" not in pj.get("prune", {}).get("env", {}):
+    problems.append("service-publish.yaml: the prune job does not pass KEEP_TREE")
+# the registry cache: refreshed by the publish and by pull-request runs that push; forks and Dependabot only read it
+for lang, image in flat_images.items():
+    b_ = step_by_id(image, "build")
+    cto = (b_ or {}).get("with", {}).get("cache-to", "")
+    if "steps.mode.outputs.push == 'true'" not in cto or "type=registry" not in cto or "mode=max" not in cto:
+        problems.append(f"service-ci-{lang}.yaml: cache-to of the image build must be set only for runs that push")
+if "mode=max" not in step_by_id(pj["image"], "build")["with"].get("cache-to", ""):
+    problems.append("service-publish.yaml: the build must write the registry cache")
+# the merge button: one reusable workflow, one job, in the environment merge, only gh
+if not os.path.exists(os.path.join(wfdir, "service-merge.yaml")):
+    problems.append("service-merge.yaml is missing")
+else:
+    mw = load("service-merge.yaml")
+    mi = mw["on"]["workflow_call"]["inputs"]
+    if mi.get("start-publish", {}).get("type") != "boolean" or mi["start-publish"].get("default") is not True:
+        problems.append("service-merge.yaml: input start-publish must be a boolean defaulting to true")
+    mj = mw["jobs"]
+    if list(mj) != ["merge"] or mj["merge"].get("environment") != "merge":
+        problems.append("service-merge.yaml: exactly one job, merge, in the environment merge")
+    else:
+        order = [s_.get("name") for s_ in mj["merge"]["steps"]]
+        if order != ["Check that the environment was approved", "Squash-merge the pull request that was tested", "Start Publish"]:
+            problems.append(f"service-merge.yaml: steps are {order}; the approval check must come first, the start of Publish last")
+        if mj["merge"]["permissions"] != {"contents": "write", "pull-requests": "write", "actions": "write"}:
+            problems.append("service-merge.yaml: the job needs exactly contents, pull-requests and actions: write")
+        if any("uses" in s_ for s_ in mj["merge"]["steps"]):
+            problems.append("service-merge.yaml: uses an action; it must only use gh")
 # the tag button
 if not os.path.exists(os.path.join(wfdir, "release.yaml")):
     problems.append("release.yaml is missing")

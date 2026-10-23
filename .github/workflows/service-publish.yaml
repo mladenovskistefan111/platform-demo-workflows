@@ -17,7 +17,7 @@ name: Service publish
 #                               differs from the scanned one fails the run), cosign sign (keyless), verify; refuses commits not reachable from main
 #   Publish: SBOM               SBOM attestation, signed, verified; next to the helm pull request, not before it; a failure fails the run
 #   Deploy: Open dev PR         the pull request in the helm repository that moves env `dev` to this digest (gitops-promote.yaml, unchanged)
-#   Cleanup: Prune staging      best effort (the job may fail without failing the run): keep the newest N `sha-*` and N `tree-*` versions of
+#   Cleanup: Prune staging      best effort (the job may fail without failing the run): keep the newest `prune-keep` (10) `sha-*` and `prune-keep-tree` (20) `tree-*` versions of
 #                               the ghcr.io package, never the buildcache package, never an image-index child of a kept image
 # Release tags and `latest` are not made here: a version is chosen when the digest is promoted to stage/prod in the helm repository.
 #
@@ -72,9 +72,13 @@ on:
         type: boolean
         default: true
       prune-keep:
-        description: How many of the newest `sha-*` and of the newest `tree-*` versions the prune keeps
+        description: How many of the newest `sha-*` versions of the ghcr.io package the prune keeps
         type: number
         default: 10
+      prune-keep-tree:
+        description: How many of the newest `tree-*` versions it keeps (every pull-request push makes one, so more than `sha-*`)
+        type: number
+        default: 20
     secrets:
       DOCKERHUB_USERNAME:
         required: true
@@ -276,7 +280,6 @@ jobs:
             org.opencontainers.image.revision=${{ github.event.pull_request.head.sha || github.sha }}
             io.platform-demo.tree=${{ steps.find.outputs.tree }}
             io.platform-demo.build-run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          # main is the only place the registry build cache is written
           cache-from: type=registry,ref=${{ steps.cache.outputs.ref }}
           cache-to: type=registry,ref=${{ steps.cache.outputs.ref }},mode=max,image-manifest=true,oci-mediatypes=true
 
@@ -628,6 +631,7 @@ jobs:
       OWNER: ${{ github.repository_owner }}
       PACKAGE: ${{ github.event.repository.name }}
       KEEP: ${{ inputs.prune-keep }}
+      KEEP_TREE: ${{ inputs.prune-keep-tree }}
       UNTAGGED_DAYS: 7
       DRY_RUN: "false"
     steps:
@@ -649,11 +653,12 @@ jobs:
 
           try:
               keep = int(float(os.environ["KEEP"]))
+              keep_tree = int(float(os.environ["KEEP_TREE"]))
               untagged_days = int(float(os.environ["UNTAGGED_DAYS"]))
           except ValueError:
-              die("keep and untagged-days must be numbers")
-          if keep < 1 or untagged_days < 1:
-              die("keep and untagged-days must be at least 1")
+              die("keep, keep-tree and untagged-days must be numbers")
+          if keep < 1 or keep_tree < 1 or untagged_days < 1:
+              die("keep, keep-tree and untagged-days must be at least 1")
           # a plain package name only: "<package>/buildcache" (and anything else with a slash) can never be addressed
           if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", package):
               die(f"package '{package}' is not a plain container package name (lower case, no slash)")
@@ -708,11 +713,12 @@ jobs:
               return any(not t.startswith(FAMILIES) for t in v["_tags"])
 
 
-          kept, old_tagged = [], []                   # the newest `keep` of EACH family stay; a version carrying both tags stays if either keeps it
+          KEEP_OF = {"sha-": keep, "tree-": keep_tree}  # every pull-request push makes a tree- version, so that family keeps more
+          kept, old_tagged = [], []                   # the newest N of EACH family stay; a version carrying both tags stays if either keeps it
           for prefix in FAMILIES:
               ranked = [v for v in versions if any(t.startswith(prefix) for t in v["_tags"])]
-              kept += [v for v in ranked[:keep] if v not in kept]
-              old_tagged += [v for v in ranked[keep:] if v not in old_tagged]
+              kept += [v for v in ranked[:KEEP_OF[prefix]] if v not in kept]
+              old_tagged += [v for v in ranked[KEEP_OF[prefix]:] if v not in old_tagged]
           old_tagged = [v for v in old_tagged if v not in kept]
           anchors = kept + [v for v in versions if protected(v) and v not in kept]   # their manifests must stay complete
           untagged = [v for v in versions if not v["_tags"]]
@@ -761,7 +767,7 @@ jobs:
                   continue
               if v["name"] in referenced:
                   continue
-              plan.append((v, f"older than the newest {keep} versions of its tag family"))
+              plan.append((v, f"older than the newest of its tag family (keeping {keep} sha-*, {keep_tree} tree-*)"))
           for v in untagged:
               if v["_created"] < cutoff and v["name"] not in referenced:
                   plan.append((v, f"untagged for more than {untagged_days} days and not referenced by a kept image"))
@@ -769,7 +775,7 @@ jobs:
           def show(v):
               return f"id={v['id']} {v['name'][:19]} created={v['_created']:%Y-%m-%d %H:%M} tags={','.join(v['_tags']) or '-'}"
 
-          print(f"{owner}/{package}: {len(versions)} version(s): {len(kept)} kept (the newest {keep} of each of sha-*, tree-*), "
+          print(f"{owner}/{package}: {len(versions)} version(s): {len(kept)} kept (newest {keep} sha-*, newest {keep_tree} tree-*), "
                 f"{len([v for v in anchors if v not in kept])} with other tags (never deleted), {len(untagged)} untagged, "
                 f"{len(referenced & by_digest)} referenced by kept images")
           for v in kept:

@@ -305,8 +305,9 @@ jobs:
             org.opencontainers.image.revision=${{ github.event.pull_request.head.sha || github.sha }}
             io.platform-demo.tree=${{ steps.find.outputs.tree }}
             io.platform-demo.build-run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          # read-only: a pull request never writes the cache; the publish run writes it when it has to build
+          # a run that pushes the image (same repository, not Dependabot) also refreshes the cache; a fork's or Dependabot's run only reads it
           cache-from: type=registry,ref=${{ steps.cache.outputs.ref }}
+          cache-to: ${{ steps.mode.outputs.push == 'true' && format('type=registry,ref={0},mode=max,image-manifest=true,oci-mediatypes=true', steps.cache.outputs.ref) || '' }}
 
       - name: Record the image to scan
         id: image

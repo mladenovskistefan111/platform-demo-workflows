@@ -306,22 +306,28 @@ def protected(v):                           # a tag outside the families: latest
     return any(not t.startswith(FAMILIES) for t in v["_tags"])
 
 
-kept, old_tagged = [], []                   # the newest `keep` of EACH family stay; a version carrying both tags stays if either keeps it
+KEEP_OF = {"sha-": keep, "tree-": keep_tree}  # every pull-request push makes a tree- version, so that family keeps more
+kept, old_tagged = [], []                   # the newest N of EACH family stay; a version carrying both tags stays if either keeps it
 for prefix in FAMILIES:
     ranked = [v for v in versions if any(t.startswith(prefix) for t in v["_tags"])]
-    kept += [v for v in ranked[:keep] if v not in kept]
-    old_tagged += [v for v in ranked[keep:] if v not in old_tagged]
+    kept += [v for v in ranked[:KEEP_OF[prefix]] if v not in kept]
+    old_tagged += [v for v in ranked[KEEP_OF[prefix]:] if v not in old_tagged]
 old_tagged = [v for v in old_tagged if v not in kept]
 anchors = kept + [v for v in versions if protected(v) and v not in kept]   # their manifests must stay complete
 '''), src)
-    step = sub(step, "{len(kept)} kept sha-* (newest {keep}), ", "{len(kept)} kept (the newest {keep} of each of sha-*, tree-*), ", src)
+    step = sub(step, "{len(kept)} kept sha-* (newest {keep}), ", "{len(kept)} kept (newest {keep} sha-*, newest {keep_tree} tree-*), ", src)
+    step = sub(step, '              keep = int(float(os.environ["KEEP"]))\n',
+               '              keep = int(float(os.environ["KEEP"]))\n              keep_tree = int(float(os.environ["KEEP_TREE"]))\n', src)
+    step = sub(step, "if keep < 1 or untagged_days < 1:", "if keep < 1 or keep_tree < 1 or untagged_days < 1:", src)
+    step = sub(step, 'die("keep and untagged-days must be numbers")', 'die("keep, keep-tree and untagged-days must be numbers")', src)
+    step = sub(step, 'die("keep and untagged-days must be at least 1")', 'die("keep, keep-tree and untagged-days must be at least 1")', src)
     step = sub(step, 'die("no sha-* tagged version to keep; refusing to delete anything (is the tag format still sha-<commit>?)")',
                'die("no sha-* or tree-* tagged version to keep; refusing to delete anything (did the tag format change?)")', src)
-    step = sub(step, 'f"older than the newest {keep} sha-* versions"', 'f"older than the newest {keep} versions of its tag family"', src)
+    step = sub(step, 'f"older than the newest {keep} sha-* versions"', 'f"older than the newest of its tag family (keeping {keep} sha-*, {keep_tree} tree-*)"', src)
     step = sub(step, "{len(kept)} newest sha-* kept;", "{len(kept)} newest kept;", src)
     env = j.raw("env")
     env = sub(env, "      PACKAGE: ${{ inputs.package }}", "      PACKAGE: ${{ github.event.repository.name }}", j.src)
-    env = sub(env, "      KEEP: ${{ inputs.keep }}", "      KEEP: ${{ inputs.prune-keep }}", j.src)
+    env = sub(env, "      KEEP: ${{ inputs.keep }}", "      KEEP: ${{ inputs.prune-keep }}\n      KEEP_TREE: ${{ inputs.prune-keep-tree }}", j.src)
     env = sub(env, "      UNTAGGED_DAYS: ${{ inputs.untagged-days }}", "      UNTAGGED_DAYS: 7", j.src)
     env = sub(env, "      DRY_RUN: ${{ inputs.dry-run }}", '      DRY_RUN: "false"', j.src)
     assert j.raw("permissions").split("\n")[:3] == ["    permissions:", "      packages: write", "      contents: read"], j.raw("permissions")
@@ -354,7 +360,7 @@ name: Service publish
 #                               differs from the scanned one fails the run), cosign sign (keyless), verify; refuses commits not reachable from main
 #   Publish: SBOM               SBOM attestation, signed, verified; next to the helm pull request, not before it; a failure fails the run
 #   Deploy: Open dev PR         the pull request in the helm repository that moves env `dev` to this digest (gitops-promote.yaml, unchanged)
-#   Cleanup: Prune staging      best effort (the job may fail without failing the run): keep the newest N `sha-*` and N `tree-*` versions of
+#   Cleanup: Prune staging      best effort (the job may fail without failing the run): keep the newest `prune-keep` (10) `sha-*` and `prune-keep-tree` (20) `tree-*` versions of
 #                               the ghcr.io package, never the buildcache package, never an image-index child of a kept image
 # Release tags and `latest` are not made here: a version is chosen when the digest is promoted to stage/prod in the helm repository.
 #
@@ -409,9 +415,13 @@ on:
         type: boolean
         default: true
       prune-keep:
-        description: How many of the newest `sha-*` and of the newest `tree-*` versions the prune keeps
+        description: How many of the newest `sha-*` versions of the ghcr.io package the prune keeps
         type: number
         default: 10
+      prune-keep-tree:
+        description: How many of the newest `tree-*` versions it keeps (every pull-request push makes one, so more than `sha-*`)
+        type: number
+        default: 20
     secrets:
       DOCKERHUB_USERNAME:
         required: true

@@ -8,9 +8,11 @@ tools/gen-callers.py grants in the generated callers, for all 11 app repositorie
 The grant of the `ci` and `publish` jobs must also be EXACTLY what the called file's jobs need (least privilege): ci = contents read +
 packages write (the image job pushes the tree image), plus checks: write for dotnet and nobody else; publish = contents read +
 packages write + id-token write.
-The `merge` job of ci.yaml (it lives in the caller, so it is not nested) must grant exactly contents, pull-requests and actions
-write, run after `ci`, use the environment `merge`, be limited to same-repository pull requests, and never be a job of a called
-workflow (so it can never become part of `gate`); publish.yaml must accept the `before` dispatch input and pass it on.
+The `merge` job of ci.yaml is a short `uses: service-merge.yaml` job after `ci` that grants exactly contents, pull-requests and
+actions write (what service-merge.yaml's job needs, also checked against the ceiling like any nested job), is limited to
+same-repository non-Dependabot pull requests, and never is a job of service-ci-* (so it can never become part of `gate`);
+service-merge.yaml has one job in the environment `merge` and uses no action; publish.yaml must accept the `before` dispatch input and
+pass it on.
 usage: check-permissions.py   (run from the repository root; needs PyYAML)"""
 import re, subprocess, sys, tempfile, pathlib
 import yaml
@@ -90,21 +92,27 @@ with tempfile.TemporaryDirectory() as tmp:
                     problems.append(f"{svc}:{name} has jobs {sorted(caller['jobs'])}, expected ci and merge")
                     continue
                 m = caller["jobs"]["merge"]
-                if grants(m.get("permissions")) != MERGE_PERMS:
-                    problems.append(f"{svc}:{name} merge grants {grants(m.get('permissions'))}, expected exactly {MERGE_PERMS}")
-                if m.get("needs") != "ci" or m.get("environment") != "merge" or "uses" in m:
-                    problems.append(f"{svc}:{name} merge must be a job with steps that needs ci and uses the environment merge")
+                mt = re.match(r".*/platform-demo-workflows/\.github/workflows/([a-z-]+\.yaml)@[0-9a-f]{40}$", m.get("uses", ""))
+                if not mt or mt.group(1) != "service-merge.yaml":
+                    problems.append(f"{svc}:{name} merge must call service-merge.yaml, it calls {m.get('uses')}")
+                else:
+                    merge_wf = load(WF / "service-merge.yaml")
+                    walk(merge_wf, grants(m.get("permissions")), f"{svc}:{name}>service-merge.yaml", problems)
+                    if grants(m.get("permissions")) != MERGE_PERMS or needed(merge_wf) != MERGE_PERMS:
+                        problems.append(f"{svc}:{name} merge grants {grants(m.get('permissions'))}, service-merge.yaml needs {needed(merge_wf)}; both must be exactly {MERGE_PERMS}")
+                    if list(merge_wf["jobs"]) != ["merge"] or merge_wf["jobs"]["merge"].get("environment") != "merge":
+                        problems.append("service-merge.yaml must have exactly one job, merge, in the environment merge")
+                    if any("uses" in st for st in merge_wf["jobs"]["merge"]["steps"]):
+                        problems.append("service-merge.yaml uses an action; it must only use gh (nothing to pin, nothing to trust)")
+                if m.get("needs") != "ci" or "timeout-minutes" in m or "environment" in m or "steps" in m:
+                    problems.append(f"{svc}:{name} merge must be a short `uses:` job that needs ci (the environment and timeout live in service-merge.yaml)")
                 cond = str(m.get("if", ""))
-                for part in ("github.event_name == 'pull_request'", "github.event.pull_request.head.repo.full_name == github.repository"):
+                for part in ("github.event_name == 'pull_request'", "github.event.pull_request.head.repo.full_name == github.repository", "dependabot[bot]"):
                     if part not in cond:
                         problems.append(f"{svc}:{name} merge: `if` lacks {part!r}")
-                if "timeout-minutes" not in m:
-                    problems.append(f"{svc}:{name} merge has no timeout-minutes")
-                if any("uses" in st for st in m["steps"]):
-                    problems.append(f"{svc}:{name} merge uses an action; it must only use gh (nothing to pin, nothing to trust)")
-                starts_publish = any("gh workflow run publish.yaml" in st.get("run", "") for st in m["steps"])
-                if starts_publish != (svc != "product-catalog-db"):
-                    problems.append(f"{svc}:{name} merge {'starts' if starts_publish else 'does not start'} Publish, but this repository {'has' if svc != 'product-catalog-db' else 'has no'} publish.yaml")
+                start = (m.get("with") or {}).get("start-publish", True)
+                if start != (svc != "product-catalog-db"):
+                    problems.append(f"{svc}:{name} merge {'starts' if start else 'does not start'} Publish, but this repository {'has' if svc != 'product-catalog-db' else 'has no'} publish.yaml")
             else:
                 dispatch = ((caller["on"].get("workflow_dispatch") or {}).get("inputs") or {})
                 if "before" not in dispatch or job["with"].get("before") != "${{ inputs.before }}":

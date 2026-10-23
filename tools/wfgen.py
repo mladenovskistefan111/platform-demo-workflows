@@ -276,20 +276,23 @@ def find_step(can_push):
 
 
 def build_step(*, push, cache_write):
-    """The build. push = an expression or 'true'. Pull requests that cannot push load the image into the local daemon instead."""
+    """The build. push = 'expr' (decided by the `mode` step) or 'true'. A run that cannot push loads the image into the local daemon instead.
+    cache_write = True (the publish) or 'when-pushing' (pull requests: only the runs that push write the registry cache)."""
     if push == "true":
         pushing = "          push: true\n          tags: ${{ steps.find.outputs.tag-ref }}\n"
     else:
         pushing = ("          push: ${{ steps.mode.outputs.push == 'true' }}\n"
                    "          load: ${{ steps.mode.outputs.push != 'true' }}\n"
                    "          tags: ${{ steps.mode.outputs.push == 'true' && steps.find.outputs.tag-ref || 'service-ci-scan:local' }}\n")
-    if cache_write:
-        cache = ("          # main is the only place the registry build cache is written\n"
-                 "          cache-from: type=registry,ref=${{ steps.cache.outputs.ref }}\n"
-                 "          cache-to: type=registry,ref=${{ steps.cache.outputs.ref }},mode=max,image-manifest=true,oci-mediatypes=true\n")
+    cache_to = "type=registry,ref=${{ steps.cache.outputs.ref }},mode=max,image-manifest=true,oci-mediatypes=true"
+    if cache_write is True:
+        cache = ("          cache-from: type=registry,ref=${{ steps.cache.outputs.ref }}\n"
+                 f"          cache-to: {cache_to}\n")
     else:
-        cache = ("          # read-only: a pull request never writes the cache; the publish run writes it when it has to build\n"
-                 "          cache-from: type=registry,ref=${{ steps.cache.outputs.ref }}\n")
+        assert cache_write == "when-pushing", cache_write
+        cache = ("          # a run that pushes the image (same repository, not Dependabot) also refreshes the cache; a fork's or Dependabot's run only reads it\n"
+                 "          cache-from: type=registry,ref=${{ steps.cache.outputs.ref }}\n"
+                 "          cache-to: ${{ steps.mode.outputs.push == 'true' && format('type=registry,ref={0},mode=max,image-manifest=true,oci-mediatypes=true', steps.cache.outputs.ref) || '' }}\n")
     return ("      - name: Build the image\n"
             "        id: build\n"
             "        if: steps.find.outputs.found != 'true'\n"

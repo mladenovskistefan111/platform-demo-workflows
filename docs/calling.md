@@ -12,12 +12,11 @@ concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }
 jobs:
   ci: { permissions: { contents: read, packages: write }, uses: .../service-ci-go.yaml@<sha> # v3.4.0, with: { test-packages: ..., ... } }
   # service-ci-<go|node|python|java|dotnet|none>.yaml; only dotnet also needs checks: write (test reporter); product-catalog-db: -none with image: false
-  merge:                                  # the merge button: NOT part of `gate`, after it
+  merge:                                  # the merge button: NOT part of `gate`, after it; the logic is service-merge.yaml
     needs: ci
     if: pull_request, same repository, not Dependabot
-    environment: merge                    # the owner is the required reviewer: Review deployments, Approve and deploy
     permissions: { contents: write, pull-requests: write, actions: write }
-    steps: [check the approval, check the branch still is the tested commit, gh pr merge --squash, gh workflow run publish.yaml --ref main -f before=<main before the merge>]
+    uses: .../service-merge.yaml@<sha> # v3.4.0   (product-catalog-db: with: { start-publish: false })
 # .github/workflows/publish.yaml (shape)
 on: { push: { branches: [main] }, workflow_dispatch: { inputs: { before: {type: string, default: ""} } } }
 concurrency: { group: publish-${{ github.ref }}, cancel-in-progress: false }
@@ -66,7 +65,7 @@ Guard: Changes -> Image: Find or build -> Image: Scan -> Publish: Copy, sign, ve
 | `Publish: Copy, sign, verify` | refuses commits not reachable from `main`; copies the digest to Docker Hub as `sha-<7 chars of the commit>` only (no `latest`, no semver), never moves an existing tag, **fails hard if the Docker Hub digest differs from the scanned one**, cosign signs (keyless) and verifies. Job summary: tree, reused or built, digest, tag, signature, link to the helm pull requests |
 | `Publish: SBOM` | SPDX SBOM as a signed attestation, verified. Own job, so it is not on the way to the helm pull request; a failure fails the run visibly |
 | `Deploy: Open dev PR` | the pull request in the helm repository that moves `dev` to this digest (`permissions: {}`, App token) |
-| `Cleanup: Prune staging` | `continue-on-error: true`, never delays the helm pull request: keeps the newest N (input `prune-keep`, 10) `sha-*` and the newest N `tree-*` versions of the ghcr.io package, never the `buildcache` package, never an image-index child of a kept image |
+| `Cleanup: Prune staging` | `continue-on-error: true`, never delays the helm pull request: keeps the newest `prune-keep` (10) `sha-*` and the newest `prune-keep-tree` (20) `tree-*` versions of the ghcr.io package, never the `buildcache` package, never an image-index child of a kept image |
 
 Concurrency (`publish-<ref>`, no cancel) lives in the caller: one publish at a time. **A run that waits behind a running one is replaced by
 a newer waiting one**, so of three quick merges the second never publishes by itself; the third publishes the tree of `main`, which contains
@@ -83,14 +82,15 @@ move in between, so the image the pull request built and scanned is the image th
 tested is what ships. If `main` did move (another merge in between), the tree differs, the lookup finds nothing and the publish builds the
 final tree itself; the same happens when the PR image was pruned or the pull request came from a fork or from Dependabot (their token cannot
 push). Only the Docker Hub copy, the signature, the SBOM and the helm pull request are new work after the merge; the scan is repeated on
-purpose. Details, limits and the trust boundary: [Build once per tree](build-once.md).
+purpose. Details, limits and the trust boundary: [Build once per tree](build-once.md). The registry build cache is refreshed by the publish when it builds and by every pull-request run that pushes (same repository, not Dependabot); forks and Dependabot only read it.
 
 ### The merge button
 
-After `ci / gate` the `merge` job of `ci.yaml` waits in the GitHub environment `merge` (required reviewer: the owner). On the run page:
-**Review deployments, Approve and deploy**; the job then checks that the branch still is the tested commit, squash-merges the pull request
+After `ci / gate` the `merge` job of `ci.yaml` (a short `uses:` job, the logic is `service-merge.yaml`, defined once) waits in the GitHub
+environment `merge` (required reviewer: the owner). On the run page: **Review deployments, Approve and deploy**; the job then checks that
+the run was approved, that the branch still is the tested commit, squash-merges the pull request
 (`gh pr merge --squash --delete-branch`, title and body from the pull request) with the workflow token and starts `Publish`
 (`gh workflow run publish.yaml --ref main -f before=<main before the merge>`). A merge made with the workflow token does not fire the push
 trigger, hence the explicit start; the normal GitHub Merge button still works and starts Publish by push, and the concurrency group keeps
-the two apart (a second run finds the tree image). The job runs the pull request's own workflow files after the approval: **read a change
-to `.github/workflows` before you approve it.** Fork and Dependabot pull requests have no `merge` job (read-only token): use the normal button.
+the two apart (a second run finds the tree image). The caller file is the pull request's own: **read a change to `.github/workflows`
+before you approve it.** Fork and Dependabot pull requests have no `merge` job (read-only token): use the normal button.
