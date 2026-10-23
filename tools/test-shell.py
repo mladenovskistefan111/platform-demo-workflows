@@ -12,8 +12,12 @@ jq, python3 and PyYAML.  usage: tools/test-shell.py [repo-dir]      exit 1 and o
     the short caller job that calls it
   * the run summaries: what changed (file list capped, hostile file names), the image section, the published section, scan, SBOM, prune
   * the release tag button (version check, existing tag, annotated tag on the commit)
+  * the promotion chain of service-publish (v3.6): Wait for dev|stage|prod (merged, replaced by a newer build, closed, timeout, API errors),
+    the approval check, the re-check after the click (superseded), the version logic (none -> 1.0.0, highest +1, look-alike tags, the version in
+    the stage file, prod takes stage's), the release (idempotent, never moves a tag, 403 and ruleset answers told apart) and the check that dev
+    does not already run a newer commit; all against a stub gh that plays platform-demo-helm
 """
-import hashlib, json, os, shutil, stat, subprocess, sys, tempfile, textwrap
+import hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, textwrap
 from datetime import datetime, timedelta, timezone
 import yaml
 
@@ -832,6 +836,473 @@ e, rc, out, deleted = prune_run(odd, {v["name"]: idx([]) for v in odd}, {"KEEP":
 summ = parse_summary(e)
 check("summary: prune: registry text in the table is reduced to plain characters", rc == 0 and deleted == [1] and "sha-0000001?" in summ and "<b>" not in summ and "`x" not in summ, f"rc={rc} {deleted}\n{summ}")
 e.done()
+
+
+# ───────────────────────── the promotion chain after `Open dev PR` (service-publish.yaml) ─────────────────────────
+# One stub of gh for all of it: platform-demo-helm is a dictionary (values files per environment and ref, tags, pull requests, releases).
+# A value that is a LIST is consumed call by call (the last one stays), so "open, open, merged" can be told.
+GH_CHAIN_STUB = r"""#!/usr/bin/env python3
+import json, os, re, subprocess, sys
+d = os.environ["STUB_DIR"]
+args = sys.argv[1:]
+with open(os.environ["STUB_LOG"], "a") as f:
+    f.write("gh " + " ".join(args) + "\n")
+st = json.load(open(d + "/chain.json"))
+
+def save():
+    json.dump(st, open(d + "/chain.json", "w"))
+
+def seq(key, value):
+    if not isinstance(value, list):
+        return value
+    pos = st.setdefault("pos", {})
+    i = pos.get(key, 0)
+    pos[key] = i + 1
+    save()
+    return value[min(i, len(value) - 1)]
+
+def emit(obj):
+    text = obj if isinstance(obj, str) else json.dumps(obj)
+    for flag in ("--jq", "-q"):
+        if flag in args and not isinstance(obj, str):
+            p = subprocess.run(["jq", "-r", args[args.index(flag) + 1]], input=text, capture_output=True, text=True)
+            sys.stdout.write(p.stdout); sys.exit(p.returncode)
+    print(text)
+    sys.exit(0)
+
+def err(msg, code=1):
+    print(msg, file=sys.stderr); sys.exit(code)
+
+def not_found():
+    err("{\"message\":\"Not Found\"}\ngh: Not Found (HTTP 404)")
+
+url = next((a for a in args if a.startswith("repos/")), "")
+post = "-X" in args and args[args.index("-X") + 1] == "POST"
+if "-X" in args and args[args.index("-X") + 1] in ("DELETE", "PATCH", "PUT"):
+    err("this stub refuses to change or delete anything", 98)
+H = "repos/" + st["helm"]
+m = re.match(re.escape(H) + r"/contents/envs/([a-z]+)/values/([a-z0-9-]+)\.yaml\?ref=(.+)$", url)
+if m:
+    key = m.group(1) + "@" + m.group(3)
+    fails = st.get("read_fail", {})
+    if fails.get(key, 0) > 0:
+        fails[key] -= 1; save(); err("gh: Bad Gateway (HTTP 502)")
+    if key not in st["files"]:
+        not_found()
+    sys.stdout.write(seq("file:" + key, st["files"][key])); sys.exit(0)
+m = re.match(re.escape(H) + r"/pulls/(\d+)$", url)
+if m:
+    if st.get("pr_fail"):
+        st["pr_fail"] -= 1; save(); err("gh: Bad Gateway (HTTP 502)")
+    emit(seq("pr", st["pr"]))
+if url.startswith(H + "/git/matching-refs/tags/"):
+    if st.get("tags_fail"):
+        err("gh: Bad Gateway (HTTP 502)")
+    prefix = "refs/tags/" + url.split("/git/matching-refs/tags/")[1]
+    emit([{"ref": r} for r in st["tags"] if r.startswith(prefix)])
+if url.startswith(H + "/commits?path="):
+    emit([{"sha": st["path_commit"]}])
+if url.startswith(H + "/git/ref/tags/"):
+    name = url.split("/git/ref/tags/")[1]
+    if name in st.get("tag_refs", []):
+        emit({"ref": "refs/tags/" + name, "object": {"sha": "f" * 40, "type": "commit"}})
+    not_found()
+if url == H + "/git/refs" and post:
+    if st.get("post_ref_fail"):
+        err(st["post_ref_fail"])
+    st.setdefault("tag_refs", []).append(next(a for a in args if a.startswith("ref=refs/tags/"))[len("ref=refs/tags/"):]); save()
+    emit({"ref": "created"})
+if url.startswith(H + "/releases/tags/"):
+    name = url.split("/releases/tags/")[1]
+    if name in st.get("releases", []):
+        emit({"tag_name": name})
+    not_found()
+if url == H + "/releases" and post:
+    if st.get("post_release_fail"):
+        err(st["post_release_fail"])
+    st.setdefault("releases", []).append(next(a for a in args if a.startswith("tag_name="))[len("tag_name="):]); save()
+    emit({"html_url": "x"})
+m = re.match(r"repos/([^/]+/[^/]+)/actions/runs/(\d+)/approvals$", url)
+if m:
+    emit(st["approvals"])
+m = re.match(r"repos/([^/]+/[^/]+)/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)$", url)
+if m:
+    if st.get("compare") == "error":
+        not_found()
+    emit({"status": st.get("compare", "ahead")})
+err("unexpected gh call: " + " ".join(args), 99)
+"""
+HELM_FULL = "platform-boutique/platform-demo-helm"
+CD_OLD, CD_NEW, CD_NEWER = "sha256:" + "a" * 64, "sha256:" + "b" * 64, "sha256:" + "c" * 64
+MSHA = "d" * 40
+
+
+def vals(digest, version=None, tag="sha-1234567"):
+    return f"replicas: 1\nimage:\n  tag: \"{tag}\"\n  digest: {digest}{'   # v' + version if version else ''}\nresources: {{}}\n"
+
+
+def chain_env(files=None, **over):
+    e = Env()
+    e.stub("gh", GH_CHAIN_STUB)
+    st = {"helm": HELM_FULL, "files": files or {}, "tags": [], "pr": {"merged": False, "state": "open", "merge_commit_sha": None},
+          "path_commit": MSHA, "approvals": []}
+    st.update(over)
+    json.dump(st, open(os.path.join(e.dir, "chain.json"), "w"))
+    return e
+
+
+def calls_of(e, *words):
+    return [c for c in e.calls() if all(w in c for w in words)]
+
+
+def writes(e):
+    return [c for c in e.calls() if re.search(r"-X (POST|DELETE|PATCH|PUT)", c)]
+
+
+MERGED = {"merged": True, "state": "closed", "merge_commit_sha": MSHA}
+WAIT = {k: step(pub["jobs"][k], "id", "wait")["run"] for k in ("wait-dev", "wait-stage", "wait-prod")}
+check("chain: the three wait jobs run one script", len(set(WAIT.values())) == 1)
+WAIT_RUN = WAIT["wait-dev"]
+
+
+def wait_env(extra=None):
+    base = {"GH_TOKEN": "t", "APP": "thing", "TARGET_ENV": "dev", "DIGEST": CD_NEW, "TAG": "sha-1234567", "PR_NUMBER": "7",
+            "EXPECT_VERSION": "", "WAIT_MINUTES": "1", "POLL_SECONDS": "15"}
+    base.update(extra or {})
+    return base
+
+
+# dev: open, open, merged with this build; main shows it afterwards
+e = chain_env({"dev@main": vals(CD_NEW), f"dev@{MSHA}": vals(CD_NEW)},
+              pr=[{"merged": False, "state": "open"}, {"merged": False, "state": "open"}, MERGED])
+rc, out = e.run(WAIT_RUN, wait_env())
+o, summ = e.outputs(), parse_summary(e)
+check("wait dev: the pull request merges with this build -> landed and current", rc == 0 and o.get("landed") == "true" and o.get("current") == "true"
+      and o.get("sha") == MSHA and o.get("digest") == CD_NEW and o.get("tag") == "sha-1234567"
+      and summ.startswith("### Dev deployed\n") and f"[pull request #7](https://github.com/{HELM_FULL}/pull/7)" in summ and "Approve stage deployment" in summ
+      and "ends as cancelled" in summ and not writes(e), f"rc={rc} {o}\n{summ}\n{out}")
+e.done()
+# dev: nothing was opened because main already has the digest
+e = chain_env({"dev@main": vals(CD_NEW)})
+rc, out = e.run(WAIT_RUN, wait_env({"PR_NUMBER": ""}))
+check("wait dev: no pull request and main already has the digest -> landed at once, no pull request read",
+      rc == 0 and e.outputs().get("landed") == "true" and "nothing had to change" in parse_summary(e) and not calls_of(e, "/pulls/"), f"rc={rc} {out}")
+e.done()
+# dev: no pull request, another digest (an older build did not replace a newer promotion)
+e = chain_env({"dev@main": vals(CD_NEWER)})
+rc, out = e.run(WAIT_RUN, wait_env({"PR_NUMBER": ""}))
+summ = parse_summary(e)
+check("wait dev: no pull request and another digest in dev -> superseded, green", rc == 0 and e.outputs().get("landed") == "false" and e.outputs().get("current") == "false"
+      and summ.startswith("### Dev: superseded by a newer build\n") and "not a failure" in summ, f"rc={rc} {summ}")
+e.done()
+# dev: the pull request merged with the content of a newer build
+e = chain_env({"dev@main": [vals(CD_OLD), vals(CD_NEWER)], f"dev@{MSHA}": vals(CD_NEWER)}, pr=MERGED)
+rc, out = e.run(WAIT_RUN, wait_env())
+check("wait dev: merged, but with a newer build's digest (the branch is shared) -> superseded, not 'landed'", rc == 0 and e.outputs().get("landed") == "false"
+      and "superseded by a newer build" in parse_summary(e), f"rc={rc} {out}")
+e.done()
+# dev: merged with this build, then a newer build moved dev
+e = chain_env({"dev@main": [vals(CD_OLD), vals(CD_NEWER)], f"dev@{MSHA}": vals(CD_NEW)}, pr=MERGED)
+rc, out = e.run(WAIT_RUN, wait_env())
+check("wait dev: merged with this build, dev has moved on since -> landed but not current (no approval is queued)", rc == 0 and e.outputs().get("landed") == "true"
+      and e.outputs().get("current") == "false" and "merged, then replaced by a newer build" in parse_summary(e), f"rc={rc} {e.outputs()} {out}")
+e.done()
+# dev: closed without merging
+e = chain_env({"dev@main": vals(CD_OLD)}, pr={"merged": False, "state": "closed"})
+rc, out = e.run(WAIT_RUN, wait_env())
+summ = parse_summary(e)
+check("wait dev: closed unmerged -> the chain stops with a clear message", rc != 0 and summ.startswith("### Dev: the pull request was closed without merging\n")
+      and "Nothing was changed in dev" in summ and "::error::" in out, f"rc={rc} {summ}")
+e.done()
+# dev: closed, but another pull request carried the same digest
+e = chain_env({"dev@main": vals(CD_NEW)}, pr={"merged": False, "state": "closed"})
+rc, out = e.run(WAIT_RUN, wait_env())
+check("wait dev: closed unmerged, but dev has this build anyway -> landed", rc == 0 and e.outputs().get("landed") == "true", f"rc={rc} {out}")
+e.done()
+# dev: still open after the wait
+e = chain_env({"dev@main": vals(CD_OLD)}, pr={"merged": False, "state": "open"})
+rc, out = e.run(WAIT_RUN, wait_env())
+summ = parse_summary(e)
+check("wait dev: still open after the timeout -> fails, names the pull request and the way on", rc != 0 and "waited 1 minutes, not merged yet" in summ
+      and f"https://github.com/{HELM_FULL}/pull/7" in summ and "Re-run failed jobs" in summ and len(calls_of(e, "/pulls/7")) == 4, f"rc={rc} {summ} {len(calls_of(e, '/pulls/7'))}")
+e.done()
+# dev: GitHub fails for a while
+e = chain_env({"dev@main": vals(CD_NEW), f"dev@{MSHA}": vals(CD_NEW)}, read_fail={f"dev@{MSHA}": 2, "dev@main": 1}, pr_fail=2, pr=MERGED)
+rc, out = e.run(WAIT_RUN, wait_env({"WAIT_MINUTES": "2"}))
+check("wait dev: API errors (pull request, file at the merge commit, main) are waited out or retried, then the chain goes on",
+      rc == 0 and e.outputs().get("landed") == "true" and e.outputs().get("current") == "true" and "could not read pull request" in out, f"rc={rc} {out}")
+e.done()
+e = chain_env({"dev@main": [vals(CD_OLD), vals(CD_NEW)]}, read_fail={"dev@main": 2})
+rc, out = e.run(WAIT_RUN, wait_env({"WAIT_MINUTES": "2", "PR_NUMBER": ""}))
+check("wait dev: no pull request, GitHub fails to answer for a while -> waits, then main shows another digest -> superseded", rc == 0 and e.outputs().get("landed") == "false", f"rc={rc} {out}")
+e.done()
+e = chain_env({})
+rc, out = e.run(WAIT_RUN, wait_env({"PR_NUMBER": ""}))
+check("wait dev: a missing values file stops the chain", rc != 0 and "does not exist in platform-demo-helm" in parse_summary(e), f"rc={rc} {out}")
+e.done()
+# stage: the version is read from the merged file and must be the expected one
+e = chain_env({"stage@main": vals(CD_NEW, "1.0.1"), f"stage@{MSHA}": vals(CD_NEW, "1.0.1")}, pr=MERGED)
+rc, out = e.run(WAIT_RUN, wait_env({"TARGET_ENV": "stage", "EXPECT_VERSION": "1.0.1"}))
+check("wait stage: landed with the expected version", rc == 0 and e.outputs().get("version") == "1.0.1" and e.outputs().get("landed") == "true"
+      and "### Stage deployed: version `1.0.1`" in parse_summary(e) and "thing-v1.0.1" in parse_summary(e), f"rc={rc} {out}\n{parse_summary(e)}")
+e.done()
+e = chain_env({"stage@main": vals(CD_OLD, "1.0.0"), f"stage@{MSHA}": vals(CD_NEW, "1.0.7")}, pr=MERGED)
+rc, out = e.run(WAIT_RUN, wait_env({"TARGET_ENV": "stage", "EXPECT_VERSION": "1.0.1"}))
+check("wait stage: another version than expected stops the chain", rc != 0 and "the version is not the expected one" in parse_summary(e), f"rc={rc} {out}")
+e.done()
+# stage: the pull request cannot merge any more because dev moved on (the helm promotion policy) -> superseded after the wait, green
+e = chain_env({"stage@main": vals(CD_OLD, "1.0.0"), "dev@main": vals(CD_NEWER)}, pr={"merged": False, "state": "open"})
+rc, out = e.run(WAIT_RUN, wait_env({"TARGET_ENV": "stage", "EXPECT_VERSION": "1.0.1"}))
+summ = parse_summary(e)
+check("wait stage: still open at the timeout, but dev holds a newer build -> superseded (green), the open pull request is explained",
+      rc == 0 and e.outputs().get("landed") == "false" and "can no longer merge" in summ and "promotion policy" in summ and not writes(e), f"rc={rc} {summ}")
+e.done()
+e = chain_env({"stage@main": vals(CD_OLD, "1.0.0"), "dev@main": vals(CD_NEW)}, pr={"merged": False, "state": "open"})
+rc, out = e.run(WAIT_RUN, wait_env({"TARGET_ENV": "stage", "EXPECT_VERSION": "1.0.1"}))
+check("wait stage: still open at the timeout and dev still holds this build -> red, the checks are the reason", rc != 0 and "not merged yet" in parse_summary(e), f"rc={rc} {parse_summary(e)}")
+e.done()
+# prod ends the chain
+e = chain_env({"prod@main": vals(CD_NEW, "1.0.1"), f"prod@{MSHA}": vals(CD_NEW, "1.0.1")}, pr=MERGED)
+rc, out = e.run(WAIT_RUN, wait_env({"TARGET_ENV": "prod", "EXPECT_VERSION": "1.0.1"}))
+check("wait prod: the last line says the chain is complete", rc == 0 and "### Prod deployed: version `1.0.1`" in parse_summary(e)
+      and "The chain is complete: dev, stage and prod run this build." in parse_summary(e), f"rc={rc} {out}\n{parse_summary(e)}")
+e.done()
+# present without a pull request: the commit of the file is used
+e = chain_env({"stage@main": vals(CD_NEW, "1.0.1"), f"stage@{MSHA}": vals(CD_NEW, "1.0.1")})
+rc, out = e.run(WAIT_RUN, wait_env({"TARGET_ENV": "stage", "EXPECT_VERSION": "1.0.1", "PR_NUMBER": ""}))
+check("wait stage: already in stage -> sha is the commit that last changed the file", rc == 0 and e.outputs().get("sha") == MSHA and e.outputs().get("version") == "1.0.1", f"rc={rc} {e.outputs()} {out}")
+e.done()
+# hostile or wrong inputs run nothing
+for name, over in (("digest", {"DIGEST": "sha256:xyz"}), ("app", {"APP": "x; touch pwned"}), ("pull request number", {"PR_NUMBER": "7; touch pwned"}),
+                   ("minutes", {"WAIT_MINUTES": "31"}), ("minutes 0", {"WAIT_MINUTES": "0"}), ("environment", {"TARGET_ENV": "uat"}), ("expected version", {"EXPECT_VERSION": "1.0"})):
+    e = chain_env({"dev@main": vals(CD_OLD)})
+    work = tempfile.mkdtemp(prefix="test-inj-")
+    rc, out = e.run(WAIT_RUN, wait_env(over), cwd=work)
+    check(f"wait: a wrong {name} is refused before anything runs", rc != 0 and os.listdir(work) == [] and not e.calls(), f"rc={rc} {out} {os.listdir(work)}")
+    shutil.rmtree(work, ignore_errors=True)
+    e.done()
+
+# ---- the newer-build check of dev (step dev-guard of Publish image) ----
+GUARD = step(pub["jobs"]["publish"], "id", "dev-guard")["run"]
+SHA_ = "e" * 40
+
+
+def guard_run(files, compare="ahead", extra=None, **over):
+    e = chain_env(files, compare=compare, **over)
+    env_ = {"GH_TOKEN": "t", "APP": "thing", "TARGET_ENV": "dev", "DIGEST": CD_NEW, "GITHUB_REPOSITORY": "o/app-thing", "GITHUB_SHA": SHA_}
+    env_.update(extra or {})
+    rc, out = e.run(GUARD, env_)
+    return e, rc, out
+
+
+e, rc, out = guard_run({"dev@main": vals(CD_NEWER, tag="sha-abcdef0")}, compare="behind")
+summ = parse_summary(e)
+check("dev guard: dev runs an image of a NEWER commit -> stale, green, the summary says why", rc == 0 and e.outputs().get("stale") == "true"
+      and summ.startswith("### Dev change skipped: superseded by a newer build\n") and "not a failure" in summ and calls_of(e, "compare/abcdef0..." + SHA_) and not writes(e), f"rc={rc} {summ}")
+e.done()
+for label, files, cmp_, want in (("dev runs an older commit", {"dev@main": vals(CD_OLD, tag="sha-abcdef0")}, "ahead", "false"),
+                                 ("dev already has this digest (a re-run)", {"dev@main": vals(CD_NEW, tag="sha-abcdef0")}, "behind", "false"),
+                                 ("dev's tag is not sha-<7> (another format)", {"dev@main": vals(CD_NEWER, tag="v1.2.3")}, "behind", "false"),
+                                 ("the commits cannot be compared", {"dev@main": vals(CD_NEWER, tag="sha-abcdef0")}, "error", "false"),
+                                 ("diverged history is not treated as newer", {"dev@main": vals(CD_NEWER, tag="sha-abcdef0")}, "diverged", "false"),
+                                 ("dev cannot be read", {}, "behind", "false")):
+    e, rc, out = guard_run(files, compare=cmp_)
+    check(f"dev guard: {label} -> not stale, the run goes on", rc == 0 and e.outputs().get("stale") == want and not writes(e), f"rc={rc} {e.outputs()} {out}")
+    e.done()
+for name, over in (("digest", {"DIGEST": "nope"}), ("app", {"APP": "x; touch pwned"}), ("env", {"TARGET_ENV": "dev; touch pwned"})):
+    e, rc, out = guard_run({"dev@main": vals(CD_OLD)}, extra=over)
+    check(f"dev guard: a wrong {name} is refused before anything runs", rc != 0 and not e.calls(), f"rc={rc} {out}")
+    e.done()
+
+# ---- the approval jobs: approval check, then re-check and version ----
+APPROVAL = step(pub["jobs"]["approve-stage"], "id", "approval")["run"]
+DECIDE = {k: step(pub["jobs"][k], "id", "decide")["run"] for k in ("approve-stage", "approve-prod")}
+check("chain: both approval jobs run the same two scripts", step(pub["jobs"]["approve-prod"], "id", "approval")["run"] == APPROVAL and DECIDE["approve-stage"] == DECIDE["approve-prod"])
+DECIDE_RUN = DECIDE["approve-stage"]
+for name, appr, ok in (("approved", [{"state": "approved", "user": {"login": "owner"}, "environments": [{"name": "stage"}]}], True),
+                       ("nobody approved (environment without a reviewer)", [], False),
+                       ("approval of another environment", [{"state": "approved", "user": {"login": "o"}, "environments": [{"name": "merge"}]}], False),
+                       ("a rejection", [{"state": "rejected", "user": {"login": "o"}, "environments": [{"name": "stage"}]}], False)):
+    e = chain_env({}, approvals=appr)
+    rc, out = e.run(APPROVAL, {"GH_TOKEN": "t", "GH_REPO": "o/app-thing", "RUN_ID": "5", "ENVIRONMENT": "stage"})
+    check(f"approval stage: {name}", (rc == 0) == ok and (not ok or e.outputs().get("by") == "owner") and (ok or "no approval" in parse_summary(e)), f"rc={rc} {out}")
+    e.done()
+
+
+def decide_env(files, tags=(), env_name="stage", extra=None, **over):
+    e = chain_env(files, tags=list(tags), **over)
+    env_ = {"GH_TOKEN": "t", "APP": "thing", "DIGEST": CD_NEW, "TAG": "sha-1234567", "TARGET_ENV": env_name, "BY": "owner"}
+    env_.update(extra or {})
+    return e, env_
+
+
+def version_for(tags, stage_text, label, want):
+    e, env_ = decide_env({"dev@main": vals(CD_NEW), "stage@main": stage_text}, tags)
+    rc, out = e.run(DECIDE_RUN, env_)
+    got = e.outputs().get("version")
+    check(f"version: {label}", rc == 0 and got == want and e.outputs().get("go") == "true", f"rc={rc} got={got} want={want} {out}")
+    e.done()
+
+
+def T(*v):
+    return [f"refs/tags/thing-v{x}" for x in v]
+
+
+version_for([], vals(CD_OLD), "no tag at all -> 1.0.0", "1.0.0")
+version_for(T("1.0.0", "1.0.1"), vals(CD_OLD), "the next patch after the highest tag", "1.0.2")
+version_for(T("1.0.2", "1.0.9", "1.0.10", "1.0.3"), vals(CD_OLD), "highest by number, not by text or order (1.0.10 > 1.0.9)", "1.0.11")
+version_for(T("1.2.0", "1.0.9"), vals(CD_OLD), "a higher minor is the base", "1.2.1")
+version_for(["refs/tags/thing-v9.9.9-rc1", "refs/tags/thing-v8.0.0+build", "refs/tags/thing-v01.0.0", "refs/tags/thing-v2.0", "refs/tags/thing-v2.0.0.1",
+             "refs/tags/thing-vlatest", "refs/tags/thing-v3.0.0/x", "refs/tags/thing-v1.0.4"], vals(CD_OLD), "pre-releases and look-alike tags are ignored", "1.0.5")
+version_for(T("1.0.2"), vals(CD_OLD, "1.0.7"), "a version in the stage file whose tag is not made yet counts", "1.0.8")
+version_for(T("1.0.9"), vals(CD_OLD, "1.0.2"), "the stage file's lower version does not lower it", "1.0.10")
+version_for(T("1.0.0"), vals(CD_NEW, "1.0.0"), "the digest is already in stage with a version: that version, no new one", "1.0.0")
+version_for(T("1.0.3"), vals(CD_NEW, "1.0.0"), "... even when later tags exist", "1.0.0")
+version_for(T("1.0.3"), vals(CD_NEW), "the digest is in stage without a version: a new one is chosen", "1.0.4")
+e, env_ = decide_env({"dev@main": vals(CD_NEW), "stage@main": vals(CD_OLD)}, T("1.0.1"), tags_fail=True)
+rc, out = e.run(DECIDE_RUN, env_)
+check("version: tags that cannot be listed stop the chain (never a guessed 1.0.0)", rc != 0 and not e.outputs().get("go") and "cannot choose the version" in parse_summary(e), f"rc={rc} {out}")
+e.done()
+e, env_ = decide_env({"dev@main": vals(CD_NEW), "stage@main": vals(CD_OLD)}, T("1.0.1"))
+rc, out = e.run(DECIDE_RUN, env_)
+o, summ = e.outputs(), parse_summary(e)
+check("decide stage: outputs for the promotion, summary with old -> new, the version and who approved", rc == 0 and o == {"go": "true", "digest": CD_NEW, "tag": "sha-1234567", "version": "1.0.2"}
+      and summ.startswith("### Stage approved by owner\n") and f"`{CD_OLD}`" in summ and f"`{CD_NEW}`" in summ and "`1.0.2`" in summ and not writes(e), f"rc={rc} {o}\n{summ}")
+e.done()
+# the supersede re-check
+e, env_ = decide_env({"dev@main": vals(CD_NEWER), "stage@main": vals(CD_OLD)}, T("1.0.1"))
+rc, out = e.run(DECIDE_RUN, env_)
+summ = parse_summary(e)
+check("decide stage: dev moved to a newer build while the approval waited -> go=false, green, clear summary, no tags read",
+      rc == 0 and e.outputs().get("go") == "false" and summ.startswith("### Stage not promoted: superseded by a newer build\n") and "not a failure" in summ
+      and not calls_of(e, "matching-refs"), f"rc={rc} {e.outputs()} {summ}")
+e.done()
+e, env_ = decide_env({"dev@main": vals(CD_NEW)}, T())
+rc, out = e.run(DECIDE_RUN, env_)
+check("decide stage: a missing stage file stops the chain", rc != 0 and "A promotion only changes an existing values file" in parse_summary(e), f"rc={rc} {out}")
+e.done()
+# prod
+e, env_ = decide_env({"stage@main": vals(CD_NEW, "1.0.3"), "prod@main": vals(CD_OLD, "1.0.2")}, T("1.0.9"), env_name="prod")
+rc, out = e.run(DECIDE_RUN, env_)
+check("decide prod: the version is stage's, whatever the tags say", rc == 0 and e.outputs().get("version") == "1.0.3" and e.outputs().get("go") == "true"
+      and not calls_of(e, "matching-refs") and "### Prod approved by owner" in parse_summary(e), f"rc={rc} {e.outputs()} {out}")
+e.done()
+e, env_ = decide_env({"stage@main": vals(CD_NEW), "prod@main": vals(CD_OLD, "1.0.2")}, env_name="prod")
+rc, out = e.run(DECIDE_RUN, env_)
+check("decide prod: stage without a version for this digest stops the chain", rc != 0 and "stage has no version for this digest" in parse_summary(e), f"rc={rc} {out}")
+e.done()
+e, env_ = decide_env({"stage@main": vals(CD_NEWER, "1.0.4"), "prod@main": vals(CD_OLD, "1.0.2")}, env_name="prod")
+rc, out = e.run(DECIDE_RUN, env_)
+check("decide prod: stage moved to a newer build -> superseded, nothing promoted", rc == 0 and e.outputs().get("go") == "false"
+      and "### Prod not promoted: superseded by a newer build" in parse_summary(e), f"rc={rc} {out}")
+e.done()
+for name, over in (("digest", {"DIGEST": "sha256:xyz"}), ("app", {"APP": "x; touch pwned"}), ("tag", {"TAG": "a b"}), ("environment", {"TARGET_ENV": "dev"})):
+    e, env_ = decide_env({"dev@main": vals(CD_NEW), "stage@main": vals(CD_OLD)}, extra=over)
+    work = tempfile.mkdtemp(prefix="test-inj-")
+    rc, out = e.run(DECIDE_RUN, env_, cwd=work)
+    check(f"decide: a wrong {name} is refused before anything runs", rc != 0 and os.listdir(work) == [] and not e.calls(), f"rc={rc} {out}")
+    shutil.rmtree(work, ignore_errors=True)
+    e.done()
+
+# ---- the release ----
+REL = step(pub["jobs"]["release"], "id", "release")["run"]
+
+
+def rel_env(files=None, **over):
+    base_files = {f"stage@{MSHA}": vals(CD_NEW, "1.0.1")}
+    base_files.update(files or {})
+    e = chain_env(base_files, **over)
+    return e, {"GH_TOKEN": "app", "APP": "thing", "VERSION": "1.0.1", "DIGEST": CD_NEW, "TAG": "sha-1234567", "SHA": MSHA, "CURRENT": "true",
+               "SOURCE_REPO": "o/app-thing", "SOURCE_SHA": "e" * 40, "RUN_URL": "https://github.com/o/app-thing/actions/runs/5", "GITHUB_SERVER_URL": "https://github.com"}
+
+
+e, env_ = rel_env()
+rc, out = e.run(REL, env_)
+posts = open(e.log).read().split("gh ")  # the notes have several lines: look at the raw log, one chunk per call
+posts = [c for c in posts if c.startswith("api -X POST")]
+check("release: creates the tag on the helm commit, then the release (not 'latest'), notes with the digest", rc == 0 and len(posts) == 2
+      and f"git/refs -f ref=refs/tags/thing-v1.0.1 -f sha={MSHA}" in posts[0] and "tag_name=thing-v1.0.1" in posts[1] and "make_latest=false" in posts[1]
+      and CD_NEW in posts[1] and "o/app-thing/commit/" in posts[1] and "actions/runs/5" in posts[1]
+      and "### Released `thing-v1.0.1`" in parse_summary(e) and len(writes(e)) == 2, f"rc={rc} {posts} {out}")
+e.done()
+e, env_ = rel_env(tag_refs=["thing-v1.0.1"], releases=["thing-v1.0.1"], files={"stage@thing-v1.0.1": vals(CD_NEW, "1.0.1")})
+rc, out = e.run(REL, env_)
+check("release: tag and release exist for this digest -> nothing is written, nothing is moved", rc == 0 and not writes(e) and "already existed" in parse_summary(e), f"rc={rc} {e.calls()} {out}")
+e.done()
+e, env_ = rel_env(tag_refs=["thing-v1.0.1"], files={"stage@thing-v1.0.1": vals(CD_NEW, "1.0.1")})
+rc, out = e.run(REL, env_)
+posts = writes(e)
+check("release: tag exists, release missing -> only the release is added (the tag is not touched)", rc == 0 and len(posts) == 1 and "/releases " in posts[0], f"rc={rc} {posts} {out}")
+e.done()
+e, env_ = rel_env(tag_refs=["thing-v1.0.1"], files={"stage@thing-v1.0.1": vals(CD_NEWER, "1.0.1")})
+rc, out = e.run(REL, env_)
+check("release: the tag exists for ANOTHER image -> fails, never moved", rc != 0 and not writes(e) and "A tag is never moved" in parse_summary(e), f"rc={rc} {out}")
+e.done()
+e, env_ = rel_env({f"stage@{MSHA}": vals(CD_NEW, "1.0.9")})
+rc, out = e.run(REL, env_)
+check("release: the commit does not hold this version -> fails before writing anything", rc != 0 and not writes(e) and "does not have version 1.0.1" in parse_summary(e), f"rc={rc} {out}")
+e.done()
+e, env_ = rel_env(post_ref_fail="{\"message\":\"Resource not accessible by integration\"}\ngh: Resource not accessible by integration (HTTP 403)")
+rc, out = e.run(REL, env_)
+summ = parse_summary(e)
+check("release: a 403 on the tag says which call failed and points at the App's permission", rc != 0 and "creating the tag thing-v1.0.1 failed" in summ
+      and "Contents: write" in summ and len(writes(e)) == 1, f"rc={rc} {summ}")
+e.done()
+# best effort: the job is continue-on-error, its outputs come from a first step that cannot fail, and a refusal is a warning
+relay = step(pub["jobs"]["release"], "id", "relay")["run"]
+e = Env()
+rc, out = e.run(relay, {"DIGEST": CD_NEW, "TAG": "sha-1234567", "VERSION": "1.0.1", "CURRENT": "true"})
+check("release: the outputs for the prod approval are written by the first step (they survive a failed release)",
+      rc == 0 and e.outputs() == {"digest": CD_NEW, "tag": "sha-1234567", "version": "1.0.1", "current": "true"}, f"rc={rc} {e.outputs()}")
+e.done()
+check("release: the job is continue-on-error and the relay step comes first", pub["jobs"]["release"].get("continue-on-error") is True
+      and pub["jobs"]["release"]["steps"][0]["id"] == "relay" and pub["jobs"]["approve-prod"]["if"] == "${{ needs.release.outputs.current == 'true' }}")
+e, env_ = rel_env(post_ref_fail="gh: Resource not accessible by integration (HTTP 403)")
+rc, out = e.run(REL, env_)
+check("release: a refusal is a warning annotation and the summary says the prod approval is not blocked", rc != 0 and "::warning title=Release not made::" in out
+      and "::error::" not in out and "the prod approval is not blocked" in parse_summary(e) and "Re-run failed jobs" in parse_summary(e), f"rc={rc} {out}")
+e.done()
+e, env_ = rel_env(post_ref_fail="gh: Repository rule violations found\nCannot create ref due to creations being restricted. (HTTP 422)")
+rc, out = e.run(REL, env_)
+check("release: a ruleset refusal is told apart and names the bypass list", rc != 0 and "bypass list" in parse_summary(e), f"rc={rc} {parse_summary(e)}")
+e.done()
+e, env_ = rel_env(post_release_fail="gh: Resource not accessible by integration (HTTP 403)")
+rc, out = e.run(REL, env_)
+check("release: the tag is made, then the release fails -> red (a re-run only adds the release)", rc != 0 and "creating the release thing-v1.0.1 failed" in parse_summary(e), f"rc={rc} {parse_summary(e)}")
+e.done()
+e, env_ = rel_env(post_ref_fail="gh: Reference already exists (HTTP 422)", files={"stage@thing-v1.0.1": vals(CD_NEW, "1.0.1")})
+rc, out = e.run(REL, env_)
+check("release: a second run made the tag a moment ago (same image) -> goes on", rc == 0 and "made a moment ago" in parse_summary(e), f"rc={rc} {out}")
+e.done()
+for name, over in (("version", {"VERSION": "1.0"}), ("app", {"APP": "x; touch pwned"}), ("digest", {"DIGEST": "nope"})):
+    e, env_ = rel_env()
+    env_.update(over)
+    work = tempfile.mkdtemp(prefix="test-inj-")
+    rc, out = e.run(REL, env_, cwd=work)
+    check(f"release: a wrong {name} is refused before anything runs", rc != 0 and os.listdir(work) == [] and not writes(e), f"rc={rc} {out}")
+    shutil.rmtree(work, ignore_errors=True)
+    e.done()
+e, env_ = rel_env()
+env_["SHA"] = "zz"
+rc, out = e.run(REL, env_)
+check("release: no commit to tag -> fails", rc != 0 and not writes(e), f"rc={rc} {out}")
+e.done()
+
+# ---- the values-file helpers are the helm repository's own parsing ----
+lib_env = chain_env({})
+lib = WAIT_RUN.split("title=${TARGET_ENV^}")[0]
+probe = lib + r"""
+printf 'image:\n  tag: "sha-abcdef0"\n  digest: "sha256:%s"   # v2.10.3\nother:\n  digest: sha256:%s\n' "$(printf 'a%.0s' {1..64})" "$(printf 'f%.0s' {1..64})" > "$RUNNER_TEMP/v.yaml"
+echo "digest=$(img_digest < "$RUNNER_TEMP/v.yaml")"
+echo "version=$(img_version < "$RUNNER_TEMP/v.yaml")"
+echo "tag=$(img_get tag < "$RUNNER_TEMP/v.yaml")"
+other=$(printf 'image:\n  digest: sha256:%s\n  # v1.2.3\n' "$(printf 'b%.0s' {1..64})" | img_version)
+echo "other=${other:-none}"
+"""
+rc, out = lib_env.run(probe, {"APP": "thing", "GH_TOKEN": "x"})
+check("helpers: image.digest, quotes, the version comment and the tag are read like promotion-policy.sh does (only the image: block)",
+      rc == 0 and f"digest=sha256:{'a' * 64}\n" in out and "version=2.10.3" in out and "tag=sha-abcdef0" in out and out.rstrip().endswith("other=none"), f"rc={rc} {out}")
+lib_env.done()
 
 if failures:
     print("\n\n".join(failures))

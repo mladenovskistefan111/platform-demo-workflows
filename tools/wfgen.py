@@ -120,12 +120,12 @@ def script(text, indent=10):
 # ───────────────────────── pins: taken from the workflows that already use the action ─────────────────────────
 
 def pin(action):
-    """`<action>@<sha> # <version>` as docker-build.yaml / docker-promote.yaml / changed-paths.yaml use it today."""
-    for fname in ("docker-build.yaml", "docker-promote.yaml", "changed-paths.yaml"):
+    """`<action>@<sha> # <version>` as docker-build.yaml / docker-promote.yaml / changed-paths.yaml / gitops-promote.yaml use it today."""
+    for fname in ("docker-build.yaml", "docker-promote.yaml", "changed-paths.yaml", "gitops-promote.yaml"):
         m = re.search(r"uses: (" + re.escape(action) + r"@[0-9a-f]{40} # \S+)", read_text(fname))
         if m:
             return m.group(1)
-    raise AssertionError(f"no pin for {action} in docker-build/docker-promote/changed-paths")
+    raise AssertionError(f"no pin for {action} in docker-build/docker-promote/changed-paths/gitops-promote")
 
 
 # ───────────────────────── the image steps both pipelines share ─────────────────────────

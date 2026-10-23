@@ -97,11 +97,16 @@ pub_inputs["before"] = "${{ inputs.before }}"
 
 PUB = f"""name: Publish
 
-# A merge to main publishes the image ONCE (the image the pull request built is reused when main's tree is the same; Trivy, Docker
-# Hub as sha-<commit>, cosign, SBOM) and opens the pull request in platform-demo-helm that moves `dev` to the new digest.
-# No tags, no rebuilds. The `merge` job of ci.yaml starts this workflow by hand-dispatch (a merge made with the workflow token
-# fires no push trigger) and passes `before` = main's commit before the merge, so a documentation-only merge publishes nothing.
-# Started by hand without `before`, it publishes.
+# A merge to main is ONE pipeline in this run: the image is published ONCE (the image the pull request built is reused when main's
+# tree is the same; Trivy, Docker Hub as sha-<commit>, cosign, SBOM), the pull request in platform-demo-helm moves `dev` to the new
+# digest, then YOU approve stage and prod on this run's page (Review deployments: the environments `stage` and `prod` of this
+# repository, required reviewer = the owner, deployment branch main) and each approval opens the next helm pull request.
+# No tags in this repository, no rebuilds. The `merge` job of ci.yaml starts this workflow by hand-dispatch (a merge made with the
+# workflow token fires no push trigger) and passes `before` = main's commit before the merge, so a documentation-only merge
+# publishes nothing. Started by hand without `before`, it publishes.
+#
+# There is deliberately NO workflow-level `concurrency` here: a run may wait days for a click, and a group on the whole workflow would
+# queue every later merge behind it. The jobs that must not overlap carry their own groups in service-publish.yaml.
 on:
   push:
     branches: [main]
@@ -115,16 +120,13 @@ on:
 
 permissions: {{}}
 
-concurrency:
-  group: publish-${{{{ github.ref }}}}
-  cancel-in-progress: false
-
 jobs:
   publish:
     permissions:
       contents: read
       packages: write
       id-token: write # keyless cosign signing
+      actions: read # the approval jobs read who approved the environments stage and prod of this run
     uses: {WF}/service-publish.yaml@{sha} # {ver}
 {with_block(pub_inputs)}    secrets:
       DOCKERHUB_USERNAME: ${{{{ secrets.DOCKERHUB_USERNAME }}}}

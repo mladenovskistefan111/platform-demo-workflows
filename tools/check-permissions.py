@@ -7,12 +7,14 @@ service-publish.yaml (flat too; its only nested workflow is gitops-promote.yaml)
 tools/gen-callers.py grants in the generated callers, for all 11 app repositories.
 The grant of the `ci` and `publish` jobs must also be EXACTLY what the called file's jobs need (least privilege): ci = contents read +
 packages write (the image job pushes the tree image), plus checks: write for dotnet and nobody else; publish = contents read +
-packages write + id-token write.
+packages write + id-token write + actions read (the approval jobs of the dev -> stage -> prod chain read who approved the environment).
 The `merge` job of ci.yaml is a short `uses: service-merge.yaml` job after `ci` that grants exactly contents, pull-requests and
 actions write (what service-merge.yaml's job needs, also checked against the ceiling like any nested job), is limited to
 same-repository non-Dependabot pull requests, and never is a job of service-ci-* (so it can never become part of `gate`);
 service-merge.yaml has one job in the environment `merge` and uses no action; publish.yaml must accept the `before` dispatch input and
-pass it on.
+pass it on, pass EVERY secret service-publish.yaml declares (the App secrets are used by the dev, stage and prod promotions and by the
+release), and must have NO workflow-level `concurrency` (a run waits days for a click; later merges must not queue behind it: the jobs
+that must not overlap have their own groups in service-publish.yaml, which tools/check-consistency.py checks).
 usage: check-permissions.py   (run from the repository root; needs PyYAML)"""
 import re, subprocess, sys, tempfile, pathlib
 import yaml
@@ -119,6 +121,11 @@ with tempfile.TemporaryDirectory() as tmp:
                     problems.append(f"{svc}:{name} must accept the dispatch input before and pass it to service-publish")
                 if "before" not in load(WF / target)["on"]["workflow_call"]["inputs"]:
                     problems.append(f"{target} has no input before")
+                if "concurrency" in caller:
+                    problems.append(f"{svc}:{name} has a workflow-level concurrency group; a run that waits for an approval would block every later merge")
+                declared = set(load(WF / target)["on"]["workflow_call"].get("secrets", {}))
+                if set(job.get("secrets") or {}) != declared or declared != {"DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN", "PROMOTE_APP_ID", "PROMOTE_APP_PRIVATE_KEY"}:
+                    problems.append(f"{svc}:{name} passes the secrets {sorted(job.get('secrets') or {})}, {target} declares {sorted(declared)}")
 for lang in ("go", "node", "python", "java", "dotnet", "none"):
     if "merge" in load(WF / f"service-ci-{lang}.yaml")["jobs"]:
         problems.append(f"service-ci-{lang}.yaml has a merge job; it belongs in the caller, after `gate`, and must not be part of it")
