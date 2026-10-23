@@ -5,6 +5,7 @@ edit_uri: edit/main/docs/
 nav:
   - Overview: index.md
   - How a service calls them: calling.md
+  - Build once per tree: build-once.md
   - Release model: release-model.md
   - Dependabot: dependabot.md
   - Changing a workflow: changing.md

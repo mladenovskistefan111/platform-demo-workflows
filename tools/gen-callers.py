@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Write the two caller files of an app repository: .github/workflows/ci.yaml (pull requests -> service-ci-<language>.yaml, check `ci / gate`)
-and publish.yaml (push to main -> service-publish.yaml). Removes the old ci-*.yaml / release.yaml.
+"""Write the two caller files of an app repository: .github/workflows/ci.yaml (pull requests -> service-ci-<language>.yaml, check `ci / gate`,
+then the `merge` job: the owner approves the `merge` environment on the run page and the pull request is squash-merged) and
+publish.yaml (push to main, or a manual/merge-button run with `before` -> service-publish.yaml). Removes the old ci-*.yaml / release.yaml.
 usage: gen-callers.py <repo-dir> <service> <wf-sha> <wf-ver>
 <service> is the app name = repository name without the `app-` prefix = helm chart name = Docker Hub repository."""
 import os, sys
@@ -28,6 +29,8 @@ CFG = {
 
 # inputs of service-ci-<language> (see its `on.workflow_call.inputs`); the keys in CFG["with_"] are passed through unchanged
 def with_block(d, indent="      "):
+    if not d:
+        return ""  # an empty `with:` is a syntax error for actionlint
     out = "    with:\n"
     for k, v in d.items():
         if isinstance(v, tuple):
@@ -43,17 +46,22 @@ if CFG["trivy"]:
     ci_inputs["trivyignores"] = CFG["trivy"]
 
 # The service-ci-<language> workflows are flat (no nested workflow), so GitHub validates only their own jobs: every caller grants
-# contents + packages (the image job reads the registry build cache); only the dotnet file has a job (the test reporter) that
-# needs checks: write.
+# contents: read + packages: write (the image job reads the build cache and pushes ghcr.io/<repo>:tree-<hash> for a run that may; a
+# fork's token is read-only whatever is asked); only the dotnet file has a job (the test reporter) that needs checks: write.
 ci_perms = ("      contents: read\n"
-            "      packages: read # reads the registry build cache\n")
+            "      packages: write # the image job pushes ghcr.io/<repo>:tree-<hash> (same-repository runs; a fork's token stays read-only)\n")
 if CFG["lang"] == "dotnet":
     ci_perms += "      checks: write # the test reporter publishes a check run\n"
+
+# The merge button is service-merge.yaml (defined once, like the rest). The caller keeps the `if:` (only same-repository pull requests that
+# are not Dependabot's: those have a read-only token) and grants what the called job needs; product-catalog-db has no Publish to start.
+MERGE_WITH = "" if CFG["lang"] != "none" else "    with:\n      start-publish: false # no image pipeline, hence no Publish\n"
 
 CI = f"""name: CI
 
 # Pull-request gate: guards (change detection, secrets, workflows) start at t=0; when code changed, lint, build, tests, SCA, SAST
-# and an image build + CVE scan run in parallel with them; nothing is pushed. The only required status check is `ci / gate`.
+# and an image build + CVE scan run in parallel with them (the image is pushed as ghcr.io/<repo>:tree-<hash> and reused by Publish
+# after the merge). The only required status check is `ci / gate`; `merge` comes after it and is not part of it.
 on:
   pull_request:
     branches: [main]
@@ -69,20 +77,41 @@ jobs:
   ci:
     permissions:
 {ci_perms}    uses: {WF}/service-ci-{CFG['lang']}.yaml@{sha} # {ver}
-{with_block(ci_inputs)}"""
+{with_block(ci_inputs)}
+  # The merge button: waits for you to approve the environment `merge` on the run page (Review deployments), then squash-merges the
+  # tested pull request and starts Publish. Not for forks or Dependabot (read-only token): use the normal Merge button there.
+  merge:
+    needs: ci
+    if: ${{{{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' }}}}
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write # starts Publish
+    uses: {WF}/service-merge.yaml@{sha} # {ver}
+{MERGE_WITH}"""
 
 pub_inputs = {"app": svc}
 if CFG["trivy"]:
     pub_inputs["trivyignores"] = CFG["trivy"]
+pub_inputs["before"] = "${{ inputs.before }}"
 
 PUB = f"""name: Publish
 
-# A merge to main publishes the image ONCE (ghcr.io staging, Trivy, Docker Hub as sha-<commit>, cosign, SBOM) and opens the
-# pull request in platform-demo-helm that moves `dev` to the new digest. No tags, no rebuilds.
+# A merge to main publishes the image ONCE (the image the pull request built is reused when main's tree is the same; Trivy, Docker
+# Hub as sha-<commit>, cosign, SBOM) and opens the pull request in platform-demo-helm that moves `dev` to the new digest.
+# No tags, no rebuilds. The `merge` job of ci.yaml starts this workflow by hand-dispatch (a merge made with the workflow token
+# fires no push trigger) and passes `before` = main's commit before the merge, so a documentation-only merge publishes nothing.
+# Started by hand without `before`, it publishes.
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      before:
+        description: Commit main was at before the change (empty = publish; set = a documentation-only change since then publishes nothing)
+        type: string
+        required: false
+        default: ""
 
 permissions: {{}}
 

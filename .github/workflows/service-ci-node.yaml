@@ -391,18 +391,36 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      packages: read # reads the registry build cache (ghcr.io/<repo>/buildcache); writing it is service-publish's job
+      packages: write # pushes ghcr.io/<repo>:tree-<hash> for a run that may (same repository, not Dependabot); a fork's token is read-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Decide whether this run pushes the image
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          # A run pushes the image to ghcr.io only when its token may: a pull request from a fork has a read-only token, and so has one that
+          # Dependabot opened. Those runs build into the local Docker daemon and scan that (nothing is pushed, nothing is reused).
+          push=true
+          if [ "$EVENT" = pull_request ]; then
+            if [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ] || [ "$ACTOR" = 'dependabot[bot]' ]; then
+              push=false
+            fi
+          fi
+          echo "push=$push" >> "$GITHUB_OUTPUT"
+          echo "this run pushes the image to ghcr.io: $push"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - name: Log in to ghcr.io (to read the build cache)
-        # a cache that cannot be read only makes the build slower, so a failed login must not fail the pull request
-        continue-on-error: true
+      - name: Log in to ghcr.io (to read the build cache, and to push the image)
+        # a run that cannot push only needs the cache, and a cache that cannot be read only makes the build slower: its failed login must not fail the pull request
+        continue-on-error: ${{ steps.mode.outputs.push != 'true' }}
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -413,23 +431,131 @@ jobs:
         id: cache
         run: echo "ref=ghcr.io/${GITHUB_REPOSITORY,,}/buildcache" >> "$GITHUB_OUTPUT"
 
-      - name: Build the image into the local Docker daemon
+      - name: Find an image built from this tree
+        id: find
+        env:
+          CAN_PUSH: ${{ steps.mode.outputs.push }}
+        run: |
+          set -euo pipefail
+          # The image is named after the content it was built from: the git tree of the checked-out commit. A pull request's merge commit
+          # and the squash commit that lands on main have the SAME tree when main did not move, so the image the pull request built is the
+          # image that gets published; a different tree (main moved, a rebase with other changes) finds nothing and builds.
+          tree=$(git rev-parse 'HEAD^{tree}')
+          if ! [[ "$tree" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::unexpected tree id '$tree'"
+            exit 1
+          fi
+          tag_ref="ghcr.io/${GITHUB_REPOSITORY,,}:tree-$tree"
+          found=false
+          digest=""
+          note=""
+          if [ "$CAN_PUSH" = true ]; then
+            manifest="$RUNNER_TEMP/tree-manifest.json"
+            err="$RUNNER_TEMP/tree-lookup.err"
+            for attempt in 1 2 3; do
+              if docker buildx imagetools inspect --raw "$tag_ref" > "$manifest" 2> "$err" && [ -s "$manifest" ]; then
+                found=true
+                digest="sha256:$(sha256sum "$manifest" | cut -d' ' -f1)"
+                break
+              fi
+              if grep -qiE 'not found|manifest_unknown|name_unknown|404' "$err"; then
+                note="no image for this tree yet"
+                break
+              fi
+              # Not a clean "not found" (network, registry hiccup). Building is always safe: what is built is what gets scanned and shipped.
+              note="the lookup failed ($(head -c 200 "$err" | tr '\n' ' ')), so the image is built"
+              echo "::warning::looking up $tag_ref failed (attempt $attempt of 3): $(head -c 200 "$err" | tr '\n' ' ')"
+              sleep $((attempt * 3))
+            done
+          else
+            note="this run cannot push, so nothing can be reused"
+          fi
+          {
+            echo "tree=$tree"
+            echo "tag-ref=$tag_ref"
+            echo "found=$found"
+            echo "digest=$digest"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$found" = true ]; then
+            echo "tree $tree: image exists ($digest); no build"
+          else
+            echo "tree $tree: $note"
+          fi
+
+      - name: Build the image
+        id: build
+        if: steps.find.outputs.found != 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.context }}/${{ inputs.dockerfile }}
-          push: false
-          load: true
-          tags: service-ci-scan:local
-          # read-only: pull requests (forks included) never write the cache; the publish run on main does
+          push: ${{ steps.mode.outputs.push == 'true' }}
+          load: ${{ steps.mode.outputs.push != 'true' }}
+          tags: ${{ steps.mode.outputs.push == 'true' && steps.find.outputs.tag-ref || 'service-ci-scan:local' }}
+          # where it was built (the signature of the published image names the commit that was shipped)
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha || github.sha }}
+            io.platform-demo.tree=${{ steps.find.outputs.tree }}
+            io.platform-demo.build-run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # a run that pushes the image (same repository, not Dependabot) also refreshes the cache; a fork's or Dependabot's run only reads it
           cache-from: type=registry,ref=${{ steps.cache.outputs.ref }}
+          cache-to: ${{ steps.mode.outputs.push == 'true' && format('type=registry,ref={0},mode=max,image-manifest=true,oci-mediatypes=true', steps.cache.outputs.ref) || '' }}
+
+      - name: Record the image to scan
+        id: image
+        env:
+          TREE: ${{ steps.find.outputs.tree }}
+          FOUND: ${{ steps.find.outputs.found }}
+          FOUND_DIGEST: ${{ steps.find.outputs.digest }}
+          PUSH: ${{ steps.mode.outputs.push }}
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ "$FOUND" = true ]; then
+            how=reused
+            digest=$FOUND_DIGEST
+          elif [ "$PUSH" = true ]; then
+            how=built
+            digest=$BUILT_DIGEST
+          else
+            how=local
+            digest=""
+          fi
+          if [ "$how" = local ]; then
+            ref=service-ci-scan:local
+          else
+            if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::no valid image digest (got '$digest')"
+              exit 1
+            fi
+            ref="ghcr.io/${GITHUB_REPOSITORY,,}@$digest"
+          fi
+          {
+            echo "ref=$ref"
+            echo "digest=$digest"
+            echo "how=$how"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Image"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| source tree | \`$TREE\` |"
+            case "$how" in
+              reused) echo "| image | **reused**: a build of this tree already exists, nothing was built |" ;;
+              built) echo "| image | **built** and pushed as \`tree-${TREE:0:12}...\` |" ;;
+              *) echo "| image | built locally, not pushed (this run cannot push) |" ;;
+            esac
+            [ -z "$digest" ] || echo "| digest | \`$digest\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          # same version, threshold and ignore file as the scan in docker-build.yaml
+          # same version, threshold and ignore file as the scan in service-publish.yaml (which scans the same digest again)
           version: v0.76.1
-          image-ref: service-ci-scan:local
+          image-ref: ${{ steps.image.outputs.ref }}
           format: table
           severity: CRITICAL,HIGH
           exit-code: 1

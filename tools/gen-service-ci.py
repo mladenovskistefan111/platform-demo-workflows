@@ -9,7 +9,8 @@ and contain only what the repository really runs:
 
     Guard: Changes | Guard: Secrets | Guard: Workflows      no needs: start at t=0, together
     Check: Lint | Check: Build | Check: Tests               need only `Guard: Changes` (skipped for a docs-only change), run in
-    Security: SCA | Security: SAST | Image: Build + CVE scan  parallel with the other two guards
+    Security: SCA | Security: SAST | Image: Build + CVE scan  parallel with the other two guards (the image is pushed as
+                                                                ghcr.io/<repo>:tree-<hash> by runs that may; see wfgen.py)
     gate                                                     needs EVERY job, always runs
 
 The left column means "starts at t=0", not "must pass first": a flaky gitleaks download or one lint complaint does not hide the
@@ -23,7 +24,8 @@ Source of truth (nothing is retyped here, so a fix cannot be forgotten):
   * tool versions (golangci-lint, gosec, semgrep, ...) are inputs of the stand-alone workflows; here they are written in as the
     stand-alone defaults, so they are bumped in one place;
   * input names, types and defaults are copied from the stand-alone workflow;
-  * only the image job and the gate script live in this file (service-ci.yaml, their previous home, no longer exists).
+  * the image job is assembled from the steps in tools/wfgen.py, which service-publish.yaml uses too (tree lookup, build, digest record,
+    Trivy scan: written once); only the gate script lives in this file.
 Every transformation asserts that it matched, so a refactoring of a source workflow fails here instead of silently changing a file.
 tools/check-consistency.py fails when a generated file differs from this output.
 """
@@ -32,6 +34,12 @@ import os, re, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.dirname(HERE)
 WFDIR = os.path.join(ROOT, ".github", "workflows")
+
+sys.path.insert(0, HERE)
+import wfgen  # noqa: E402
+from wfgen import Job, read_lines, sub, with_if  # noqa: E402
+
+wfgen.set_root(ROOT)
 
 LANGS = ["go", "node", "python", "java", "dotnet", "none"]
 SOURCE = {"go": "go-ci.yaml", "node": "node-ci.yaml", "python": "python-ci.yaml", "java": "java-gradle-ci.yaml", "dotnet": "dotnet-ci.yaml"}
@@ -84,75 +92,7 @@ CHECKS = {l: ["lint", "build", "test", "sca", "sast", "image"] for l in LANGS if
 CHECKS["none"] = ["image"]
 
 
-# ───────────────────────── reading the stand-alone workflows ─────────────────────────
-
-def read_lines(fname):
-    with open(os.path.join(WFDIR, fname)) as f:
-        return f.read().split("\n")
-
-
-def job_blocks(fname):
-    """{job key: its lines} of a workflow file, without the comment lines that lead into the next job."""
-    lines = read_lines(fname)
-    start = lines.index("jobs:") + 1
-    blocks, key = {}, None
-    for line in lines[start:]:
-        m = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
-        if m:
-            key = m.group(1)
-            blocks[key] = []
-        elif key is not None:
-            blocks[key].append(line)
-    for k, b in blocks.items():
-        while b and (not b[-1].strip() or b[-1].startswith("  #")):
-            b.pop()
-    return blocks
-
-
-class Job:
-    """One extracted job: its indent-4 fields as raw text, and its steps as separate blocks."""
-
-    def __init__(self, fname, key):
-        self.src = f"{fname}:{key}"
-        self.fields, cur = {}, None
-        for line in job_blocks(fname)[key]:
-            m = re.match(r"^    ([a-z-]+):(.*)$", line)
-            if m:
-                cur = m.group(1)
-                self.fields[cur] = [line]
-            elif cur:
-                self.fields[cur].append(line)
-        raw = self.fields.pop("steps")[1:]
-        self.steps, step = [], None
-        for line in raw:
-            if line.startswith("      - "):
-                step = [line]
-                self.steps.append(step)
-            elif step is not None:
-                step.append(line)
-        self.steps = ["\n".join(s).rstrip("\n") for s in self.steps]
-
-    def scalar(self, name):
-        return self.fields[name][0].split(":", 1)[1].strip()
-
-    def timeout(self):
-        return int(self.scalar("timeout-minutes"))
-
-    def raw(self, name):
-        return "\n".join(self.fields[name])
-
-
-def sub(text, old, new, src, count=1):
-    assert text.count(old) == count, f"{src}: expected {count}x {old!r}, found {text.count(old)}x"
-    return text.replace(old, new)
-
-
-def with_if(step, cond, src):
-    """Put `if: cond` right under the `- name:` line of a step."""
-    first, rest = step.split("\n", 1)
-    assert first.startswith("      - name: "), f"{src}: step has no name: {first}"
-    return f"{first}\n        if: {cond}\n{rest}"
-
+# ───────────────────────── reading the stand-alone workflows (tools/wfgen.py) ─────────────────────────
 
 def tool_defaults(lang):
     """{input name: default} of the tool-version inputs of a stand-alone workflow."""
@@ -182,18 +122,8 @@ def input_blocks(fname):
 
 # ───────────────────────── rendering ─────────────────────────
 
-def render_job(key, steps, *, timeout, perms, needs=None, cond=None, outputs=None):
-    out = [f"  {key}:", f'    name: "{NAMES[key]}"']
-    if needs:
-        out.append(f"    needs: [{', '.join(needs)}]")
-    if cond:
-        out.append(f"    if: {cond}")
-    out += ["    runs-on: ubuntu-latest", f"    timeout-minutes: {timeout}", perms]
-    if outputs:
-        out.append(outputs)
-    out.append("    steps:")
-    out.append("\n\n".join(steps))
-    return "\n".join(out) + "\n"
+def render_job(key, steps, **kw):
+    return wfgen.render_job(key, NAMES[key], steps, **kw)
 
 
 STAGE2_NEEDS = ["changes"]  # only the change detection: a failed guard must not hide the results of the checks
@@ -264,55 +194,30 @@ def lang_jobs(lang):
     return out
 
 
-# The image build + CVE scan job. Moved here from service-ci.yaml (v3.2.x), behaviour unchanged except for its needs.
-IMAGE_STEPS = """\
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Log in to ghcr.io (to read the build cache)
-        # a cache that cannot be read only makes the build slower, so a failed login must not fail the pull request
-        continue-on-error: true
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Name the registry build cache
-        id: cache
-        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY,,}/buildcache" >> "$GITHUB_OUTPUT"
-
-      - name: Build the image into the local Docker daemon
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: ${{ inputs.context }}
-          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
-          push: false
-          load: true
-          tags: service-ci-scan:local
-          # read-only: pull requests (forks included) never write the cache; the publish run on main does
-          cache-from: type=registry,ref=${{ steps.cache.outputs.ref }}
-
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          # same version, threshold and ignore file as the scan in docker-build.yaml
-          version: v0.76.1
-          image-ref: service-ci-scan:local
-          format: table
-          severity: CRITICAL,HIGH
-          exit-code: 1
-          trivyignores: ${{ inputs.trivyignores }}"""
+# The image job: build once per source tree, push it for runs that may, scan that exact digest. The steps are shared with
+# service-publish.yaml (tools/wfgen.py), which finds the image this job pushed and ships it instead of building again.
+def image_steps():
+    return [
+        wfgen.checkout_step(),
+        wfgen.mode_step(),
+        wfgen.buildx_step(),
+        wfgen.login_step("Log in to ghcr.io (to read the build cache, and to push the image)",
+                         cont="${{ steps.mode.outputs.push != 'true' }}",
+                         comment="a run that cannot push only needs the cache, and a cache that cannot be read only makes the build slower: "
+                                 "its failed login must not fail the pull request"),
+        wfgen.cache_step(),
+        wfgen.find_step("${{ steps.mode.outputs.push }}"),
+        wfgen.build_step(push="expr", cache_write="when-pushing"),
+        wfgen.record_step("${{ steps.mode.outputs.push }}"),
+        wfgen.trivy_step("${{ steps.image.outputs.ref }}",
+                         "same version, threshold and ignore file as the scan in service-publish.yaml (which scans the same digest again)"),
+    ]
 
 
 def image_job():
     perms = ("    permissions:\n      contents: read\n"
-             "      packages: read # reads the registry build cache (ghcr.io/<repo>/buildcache); writing it is service-publish's job")
-    return render_job("image", [IMAGE_STEPS], timeout=30, perms=perms, needs=STAGE2_NEEDS,
+             "      packages: write # pushes ghcr.io/<repo>:tree-<hash> for a run that may (same repository, not Dependabot); a fork's token is read-only")
+    return render_job("image", image_steps(), timeout=30, perms=perms, needs=STAGE2_NEEDS,
                       cond="${{ needs.changes.outputs.code == 'true' && inputs.image }}")
 
 
