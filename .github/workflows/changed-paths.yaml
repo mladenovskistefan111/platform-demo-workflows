@@ -1,0 +1,87 @@
+name: Changed paths
+
+# Tells service-ci and service-publish whether a change touches anything but documentation and metadata, so the expensive jobs
+# (tests, scans, image build) can be skipped for a docs-only pull request or merge. Plain git, no third-party action, no API token:
+#   pull request  -> the files the PR changes against its base (the checked-out merge commit minus its first parent)
+#   push          -> the files between `before` and the pushed commit
+#   anything else (manual run, ...) -> code = true
+# "Documentation and metadata" is: *.md, docs/**, mkdocs.yml, catalog-info.yaml, .github/dependabot.yml, CODEOWNERS, LICENSE*,
+# .github/ISSUE_TEMPLATE/**. Everything else counts as code (workflow files, Dockerfiles, .trivyignore, ... included).
+# When in doubt (no parent commit, a fetch fails, an empty change) the answer is code = true.
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/changed-paths.yaml@<sha> # <tag>
+
+on:
+  workflow_call:
+    outputs:
+      code:
+        description: "'true' unless every changed file is documentation or metadata"
+        value: ${{ jobs.detect.outputs.code }}
+
+permissions: {}
+
+jobs:
+  detect:
+    name: Detect code changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2 # a pull request's merge commit and both its parents; a push's commit and its parent
+          persist-credentials: false
+
+      - name: Compare with the base
+        id: diff
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          is_docs() {
+            case "$1" in
+              *.md|docs/*|mkdocs.yml|catalog-info.yaml|.github/dependabot.yml|CODEOWNERS|.github/CODEOWNERS|LICENSE|LICENSE.*|.github/ISSUE_TEMPLATE/*) return 0 ;;
+            esac
+            return 1
+          }
+
+          decide() { # decide <true|false> <reason>
+            echo "code=$1" >> "$GITHUB_OUTPUT"
+            echo "### Change detection: code = $1" >> "$GITHUB_STEP_SUMMARY"
+            echo "$2" >> "$GITHUB_STEP_SUMMARY"
+            echo "code=$1 ($2)"
+            exit 0
+          }
+
+          case "$EVENT_NAME" in
+            pull_request)
+              parents=$(git rev-list --parents -n 1 HEAD | wc -w)
+              [ "$parents" -eq 3 ] || decide true "HEAD is not a merge commit; assuming code"
+              base=HEAD^1
+              ;;
+            push)
+              base=""
+              if [ -n "$BEFORE_SHA" ] && [ "${BEFORE_SHA//0/}" != "" ]; then
+                git cat-file -e "${BEFORE_SHA}^{commit}" 2> /dev/null || git fetch --no-tags --depth=1 origin "$BEFORE_SHA" || true
+                git cat-file -e "${BEFORE_SHA}^{commit}" 2> /dev/null && base="$BEFORE_SHA"
+              fi
+              [ -n "$base" ] || { git rev-parse --verify --quiet HEAD^1 > /dev/null && base=HEAD^1; }
+              [ -n "$base" ] || decide true "no earlier commit to compare with"
+              ;;
+            *)
+              decide true "manual or scheduled run: everything runs"
+              ;;
+          esac
+
+          total=0
+          while IFS= read -r -d '' file; do
+            total=$((total + 1))
+            if ! is_docs "$file"; then
+              decide true "first code file: $file"
+            fi
+          done < <(git diff -z --name-only --no-renames "$base" HEAD)
+
+          [ "$total" -gt 0 ] || decide true "empty change"
+          decide false "$total file(s) changed, all documentation or metadata"

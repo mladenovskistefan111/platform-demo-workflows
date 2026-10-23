@@ -1,0 +1,538 @@
+name: Scheduled image scan
+
+# Weekly CVE scan of every image that is DEPLOYED, not of what was just built. Called from the GitOps repository (platform-demo-helm,
+# `scheduled-scans.yaml`, cron Monday 08:00 UTC) because that repository knows which digests run in which environment.
+#
+#   collect  reads envs/<env>/values/<app>.yaml (merged over the chart's own values.yaml), picks every distinct image digest
+#   scan     one matrix job per distinct digest: `trivy image <repo>@<digest>` (HIGH/CRITICAL, like docker-build.yaml), retried;
+#            SARIF to the Security tab (one category per image and environment, so alerts close when a digest is replaced)
+#   report   job summary + ONE issue "Scheduled image scan" (label security-scan), created / updated in place / closed when clean
+#
+# Why an issue and a green run: a red scheduled run emails whoever last edited the cron line, and stays red until the CVE is fixed.
+# The issue goes to everyone watching the repository and is the place where the state lives. The run goes red only when an image
+# could NOT be scanned after retries (a coverage gap), or when the caller passes `fail-on-findings: true`.
+#
+# Third-party images (Dex, Redis, kubectl, ...) are not scanned by default: they are not ours to rebuild, the finding can only be
+# acted on by bumping the version, and a weekly list of upstream CVEs would bury the findings in our own images. Set
+# `include-third-party: true` to scan them as well (they are listed as "third-party" in the table).
+#
+# Call it with (the calling job must grant contents: read, issues: write, security-events: write):
+#   uses: platform-boutique/platform-demo-workflows/.github/workflows/scheduled-image-scan.yaml@<tag or sha>
+#   secrets: { DOCKERHUB_USERNAME: ..., DOCKERHUB_TOKEN: ... }       # the READ-ONLY Docker Hub token (anonymous pulls are rate limited)
+
+on:
+  workflow_call:
+    inputs:
+      own-prefix:
+        description: Image repositories that start with this are ours (Docker Hub namespace, with the trailing slash)
+        type: string
+        default: mladenovskistefan/
+      source-org:
+        description: GitHub organisation that owns the source repositories (their Trivy ignore files are applied, like in their CI)
+        type: string
+        default: platform-boutique
+      include-third-party:
+        description: Also scan images that are not ours
+        type: boolean
+        default: false
+      fail-on-findings:
+        description: Make the run red when there are findings (by default the run stays green and the issue carries the state)
+        type: boolean
+        default: false
+      issue-title:
+        type: string
+        default: Scheduled image scan
+      max-parallel:
+        description: Concurrent scan jobs (the free plan allows 20 jobs in total)
+        type: number
+        default: 4
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
+
+# Least privilege by default; every job below declares what it needs.
+permissions: {}
+
+env:
+  # Trivy itself: bump here, in one reviewed place (same version as docker-build.yaml).
+  TRIVY_VERSION: v0.76.1
+
+jobs:
+  collect:
+    name: Collect deployed images
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.collect.outputs.matrix }}
+      count: ${{ steps.collect.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Collect the distinct image digests of all environments
+        id: collect
+        env:
+          OWN_PREFIX: ${{ inputs.own-prefix }}
+          INCLUDE_THIRD_PARTY: ${{ inputs.include-third-party }}
+        run: |
+          python3 - <<'PY'
+          import glob, json, os, re, sys
+          import yaml
+
+          own_prefix = os.environ["OWN_PREFIX"]
+          include_third_party = os.environ["INCLUDE_THIRD_PARTY"] == "true"
+          ENV_ORDER = ["dev", "stage", "prod"]
+          DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+          def load(path):
+              with open(path) as f:
+                  return yaml.safe_load(f) or {}
+
+
+          def merge(base, over):
+              if isinstance(base, dict) and isinstance(over, dict):
+                  out = dict(base)
+                  for key, value in over.items():
+                      out[key] = merge(base[key], value) if key in base else value
+                  return out
+              return over
+
+
+          def find_images(node, path=""):
+              """Every mapping that has a `repository` and a `digest` (image: {...}, images: {name: {...}})."""
+              if isinstance(node, dict):
+                  repo, digest = node.get("repository"), node.get("digest")
+                  if isinstance(repo, str) and isinstance(digest, str) and digest:
+                      yield path or ".", repo, digest
+                  for key, value in node.items():
+                      yield from find_images(value, f"{path}.{key}" if path else str(key))
+              elif isinstance(node, list):
+                  for i, value in enumerate(node):
+                      yield from find_images(value, f"{path}[{i}]")
+
+
+          def registry_ref(repo, digest):
+              first = repo.split("/")[0]
+              if "/" not in repo:
+                  repo = f"docker.io/library/{repo}"          # official Docker Hub image
+              elif "." not in first and ":" not in first and first != "localhost":
+                  repo = f"docker.io/{repo}"                  # Docker Hub namespace/name
+              return f"{repo}@{digest}"
+
+
+          def source_repo(name):
+              # app-<service> for the shop, the portal keeps its own name; no match = no ignore file (the scan still runs)
+              return name if name.startswith("platform-demo-") else f"app-{name}"
+
+
+          found = {}
+          for path in sorted(glob.glob("envs/*/values/*.yaml")):
+              env = path.split("/")[1]
+              app = os.path.splitext(os.path.basename(path))[0]
+              chart_values = f"{app}/values.yaml"
+              if not os.path.isfile(f"{app}/Chart.yaml"):
+                  continue                                    # common.yaml and the like: not an app chart
+              values = merge(load(chart_values) if os.path.isfile(chart_values) else {}, load(path))
+              for where, repo, digest in find_images(values):
+                  if not DIGEST.match(digest):
+                      print(f"::warning file={path}::{where}.digest is not a sha256 digest ({digest}); skipped")
+                      continue
+                  entry = found.setdefault((repo, digest), {"repo": repo, "digest": digest, "envs": set(), "apps": set()})
+                  entry["envs"].add(env)
+                  entry["apps"].add(app)
+
+          images = []
+          for (repo, digest), e in sorted(found.items()):
+              name = repo.split("/")[-1]
+              ours = repo.startswith(own_prefix)
+              envs = sorted(e["envs"], key=lambda x: ENV_ORDER.index(x) if x in ENV_ORDER else 99)
+              images.append({
+                  "key": f"{name}-{digest[7:19]}",
+                  "name": name,
+                  "ref": registry_ref(repo, digest),
+                  "digest": digest,
+                  "envs": " ".join(envs),
+                  "apps": " ".join(sorted(e["apps"])),
+                  "ours": ours,
+                  "srcrepo": source_repo(name) if ours else "",
+                  "scan": ours or include_third_party,
+              })
+
+          os.makedirs("collected", exist_ok=True)
+          with open("collected/images.json", "w") as f:
+              json.dump(images, f, indent=1)
+          matrix = {"include": [i for i in images if i["scan"]]}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"matrix={json.dumps(matrix, separators=(',', ':'))}\n")
+              out.write(f"count={len(matrix['include'])}\n")
+          print(f"{len(images)} distinct image digest(s), {len(matrix['include'])} to scan")
+          for i in images:
+              print(f"  {'scan' if i['scan'] else 'skip'}  {i['ref']}  [{i['envs']}] ({i['apps']})")
+          PY
+
+      - name: Keep the list for the report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-scan-list
+          path: collected/images.json
+          retention-days: 3
+
+  scan:
+    name: Scan ${{ matrix.key }}
+    needs: [collect]
+    if: needs.collect.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write # SARIF upload
+    strategy:
+      fail-fast: false # one broken image must not hide the others
+      max-parallel: ${{ inputs.max-parallel }}
+      matrix: ${{ fromJSON(needs.collect.outputs.matrix) }}
+    steps:
+      # Read-only token: lifts the anonymous Docker Hub pull limit. The credentials are stored per registry, so they are not sent to ghcr.io & co.
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+
+      # The ignore file of the image's own repository (the same accepted findings its pull-request scan uses); none = nothing accepted.
+      - name: Fetch the image's Trivy ignore file
+        id: ignore
+        env:
+          SRC_ORG: ${{ inputs.source-org }}
+          SRC_REPO: ${{ matrix.srcrepo }}
+        run: |
+          [ -n "$SRC_REPO" ] || { echo "no source repository (third-party image): no ignore file"; exit 0; }
+          for part in "$SRC_ORG" "$SRC_REPO"; do
+            [[ "$part" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::unexpected repository name '$part'"; exit 1; }
+          done
+          for file in .trivyignore.yaml .trivyignore; do
+            code=$(curl -sS --retry 3 --retry-all-errors -o "ignorefile" -w '%{http_code}' \
+              "https://raw.githubusercontent.com/${SRC_ORG}/${SRC_REPO}/HEAD/${file}") || code=000
+            case "$code" in
+              200) cp ignorefile "$RUNNER_TEMP/ignore-${file#.}"; echo "path=$RUNNER_TEMP/ignore-${file#.}" >> "$GITHUB_OUTPUT"
+                   echo "using ${SRC_ORG}/${SRC_REPO}/${file}"; exit 0 ;;
+              404) ;;
+              *)   echo "::warning::could not read ${file} from ${SRC_ORG}/${SRC_REPO} (HTTP ${code}); scanning without it" ;;
+            esac
+          done
+          echo "no ignore file in ${SRC_ORG}/${SRC_REPO}"
+
+      # Transient registry / database errors are retried; only a scan that never worked is an error.
+      - name: Trivy image scan (HIGH, CRITICAL)
+        id: trivy
+        env:
+          IMAGE_REF: ${{ matrix.ref }}
+          IGNORE_FILE: ${{ steps.ignore.outputs.path }}
+        run: |
+          args=(image --quiet --format json --output trivy.json --severity "HIGH,CRITICAL" --timeout 15m)
+          [ -z "$IGNORE_FILE" ] || args+=(--ignorefile "$IGNORE_FILE")
+          ok=false
+          for attempt in 1 2 3; do
+            rm -f trivy.json
+            if trivy "${args[@]}" "$IMAGE_REF" && [ -s trivy.json ]; then ok=true; break; fi
+            echo "::warning::scan attempt ${attempt} of ${IMAGE_REF} failed"
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 30))
+          done
+          echo "ok=${ok}" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate the result
+        id: result
+        env:
+          IMAGE_KEY: ${{ matrix.key }}
+          IMAGE_NAME: ${{ matrix.name }}
+          IMAGE_REF: ${{ matrix.ref }}
+          IMAGE_DIGEST: ${{ matrix.digest }}
+          IMAGE_ENVS: ${{ matrix.envs }}
+          SCAN_OK: ${{ steps.trivy.outputs.ok }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+
+          sev_rank = {"CRITICAL": 0, "HIGH": 1}
+          result = {
+              "key": os.environ["IMAGE_KEY"], "name": os.environ["IMAGE_NAME"], "ref": os.environ["IMAGE_REF"],
+              "digest": os.environ["IMAGE_DIGEST"], "envs": os.environ["IMAGE_ENVS"],
+              "status": "error", "findings": [],
+          }
+          if os.environ["SCAN_OK"] == "true":
+              report = json.load(open("trivy.json"))
+              for res in report.get("Results") or []:
+                  target = res.get("Target", "")
+                  for v in res.get("Vulnerabilities") or []:
+                      result["findings"].append({
+                          "kind": "vulnerability", "id": v.get("VulnerabilityID", ""), "severity": v.get("Severity", ""),
+                          "pkg": v.get("PkgName", ""), "installed": v.get("InstalledVersion", ""), "fixed": v.get("FixedVersion", ""),
+                          "title": v.get("Title", ""), "url": v.get("PrimaryURL", ""), "target": target,
+                      })
+                  for s in res.get("Secrets") or []:
+                      result["findings"].append({
+                          "kind": "secret", "id": s.get("RuleID", ""), "severity": s.get("Severity", ""), "pkg": target,
+                          "installed": str(s.get("StartLine", "")), "fixed": "", "title": s.get("Title", ""), "url": "", "target": target,
+                      })
+              result["findings"].sort(key=lambda f: (sev_rank.get(f["severity"], 9), f["id"], f["pkg"]))
+              result["status"] = "findings" if result["findings"] else "clean"
+          os.makedirs("result", exist_ok=True)
+          with open(f"result/{result['key']}.json", "w") as f:
+              json.dump(result, f, indent=1)
+          counts = {s: sum(1 for x in result["findings"] if x["severity"] == s) for s in sev_rank}
+          line = f"{result['name']} ({result['envs']}): {result['status']}, CRITICAL {counts['CRITICAL']}, HIGH {counts['HIGH']}"
+          print(line)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"- `{result['ref']}`: {result['status']}, CRITICAL {counts['CRITICAL']}, HIGH {counts['HIGH']}\n")
+          if result["status"] == "error":
+              print(f"::error::{result['ref']} could not be scanned after 3 attempts")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"status={result['status']}\n")
+          PY
+
+      - name: Convert to SARIF
+        if: steps.trivy.outputs.ok == 'true'
+        run: trivy convert --format sarif --output trivy.sarif trivy.json
+
+      # One category per image AND environment: the same digest in dev and stage uploads twice, and when a digest is replaced the old
+      # alerts of that category are closed by the next upload. A clean image uploads an empty result on purpose (that is what closes alerts).
+      - name: Upload SARIF (dev)
+        if: steps.trivy.outputs.ok == 'true' && contains(matrix.envs, 'dev')
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: trivy.sarif
+          category: image-scan/${{ matrix.name }}/dev
+          wait-for-processing: false
+
+      - name: Upload SARIF (stage)
+        if: steps.trivy.outputs.ok == 'true' && contains(matrix.envs, 'stage')
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: trivy.sarif
+          category: image-scan/${{ matrix.name }}/stage
+          wait-for-processing: false
+
+      - name: Upload SARIF (prod)
+        if: steps.trivy.outputs.ok == 'true' && contains(matrix.envs, 'prod')
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: trivy.sarif
+          category: image-scan/${{ matrix.name }}/prod
+          wait-for-processing: false
+
+      - name: Keep the result for the report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-scan-result-${{ matrix.key }}
+          path: result/${{ matrix.key }}.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Fail when the image could not be scanned
+        if: steps.result.outputs.status == 'error' || steps.trivy.outputs.ok != 'true'
+        run: |
+          echo "::error::scan did not complete"
+          exit 1
+
+  report:
+    name: Report (summary and issue)
+    needs: [collect, scan]
+    # also when a scan job failed or the scan matrix was skipped (nothing to scan): the issue must reflect it
+    if: always() && needs.collect.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ISSUE_TITLE: ${{ inputs.issue-title }}
+      FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+    steps:
+      - name: Download the scan results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-scan-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Build the report and update the issue
+        id: report
+        run: |
+          cat > "$RUNNER_TEMP/report.py" <<'PY'
+          import glob, hashlib, json, os, re, subprocess, sys
+          from datetime import datetime, timezone
+
+          TITLE = os.environ["ISSUE_TITLE"]
+          LABEL = "security-scan"
+          MAX_ROWS = 15            # findings listed per image in the issue (the Security tab and the run have all of them)
+          MAX_BODY = 60000         # an issue body may hold 65536 characters
+
+          images = json.load(open("artifacts/images.json")) if os.path.exists("artifacts/images.json") else []
+          results = {}
+          for path in glob.glob("artifacts/*.json"):
+              if os.path.basename(path) == "images.json":
+                  continue
+              r = json.load(open(path))
+              results[r["key"]] = r
+
+          run_url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+          def cell(text, n=90):
+              text = " ".join(str(text).split()).replace("|", "\\|")
+              return text if len(text) <= n else text[: n - 1] + "..."
+
+
+          rows, details, fingerprint, errors, skipped = [], [], [], [], []
+          total = {"CRITICAL": 0, "HIGH": 0}
+          for img in images:
+              if not img["scan"]:
+                  skipped.append(img)
+                  continue
+              r = results.get(img["key"])
+              short = img["digest"][7:19]
+              if r is None or r["status"] == "error":
+                  errors.append(img)
+                  fingerprint.append(f"error|{img['key']}")
+                  rows.append(f"| {img['name']} | `{short}` | {img['envs']} | - | - | could not be scanned |")
+                  continue
+              counts = {s: sum(1 for f in r["findings"] if f["severity"] == s) for s in total}
+              for s in total:
+                  total[s] += counts[s]
+              rows.append(f"| {img['name']} | `{short}` | {img['envs']} | {counts['CRITICAL']} | {counts['HIGH']} | {r['status']} |")
+              for f in r["findings"]:
+                  fingerprint.append("|".join([img["name"], f["id"], f["pkg"], f["installed"], f["target"]]))
+              if r["findings"]:
+                  lines = [f"<details><summary><b>{img['name']}</b> <code>{short}</code> ({img['envs']}): "
+                           f"{counts['CRITICAL']} critical, {counts['HIGH']} high</summary>", "",
+                           "| Severity | ID | Package | Installed | Fixed | Title |", "|---|---|---|---|---|---|"]
+                  for f in r["findings"][:MAX_ROWS]:
+                      ident = f"[{f['id']}]({f['url']})" if f["url"] else f["id"]
+                      lines.append(f"| {f['severity']} | {ident} | {cell(f['pkg'], 40)} | {cell(f['installed'], 30)} | "
+                                   f"{cell(f['fixed'] or '-', 30)} | {cell(f['title'])} |")
+                  if len(r["findings"]) > MAX_ROWS:
+                      lines.append(f"\n... and {len(r['findings']) - MAX_ROWS} more (all of them are in the run summary and the Security tab).")
+                  lines += ["", "</details>", ""]
+                  details.append("\n".join(lines))
+
+          fp = hashlib.sha256("\n".join(sorted(fingerprint)).encode()).hexdigest()[:16]
+          n_findings = len(fingerprint) - len(errors)
+          if not images:                 # a layout change that hides every image must not look like "clean"
+              fingerprint.append("no-images")
+          problem = bool(fingerprint)
+
+          head = [f"Last run: {now} ([run]({run_url})). Deployed image digests of `envs/*/values/*.yaml`, Trivy, HIGH and CRITICAL only, "
+                  "the ignore file of each image's own repository applied.", ""]
+          table = ["| Image | Digest | Environments | Critical | High | Result |", "|---|---|---|---|---|---|"] + rows
+          body_parts = head + table + [""]
+          if errors:
+              body_parts += ["**Could not be scanned** (3 attempts): " + ", ".join(f"`{e['ref']}`" for e in errors)
+                             + ". The digest may be gone from the registry or the registry was unreachable; the run is red.", ""]
+          if skipped:
+              body_parts += ["Not scanned (third-party, not ours to rebuild): " + ", ".join(f"`{s['name']}`" for s in skipped), ""]
+          if not images:
+              body_parts += ["**No image digests were found in `envs/*/values/*.yaml`.** Did the layout change? Nothing was scanned.", ""]
+          body_parts += details
+          marker = f"<!-- scan-fingerprint:{fp} -->"
+          body = "\n".join(body_parts)
+          if len(body) > MAX_BODY - 200:
+              body = body[: MAX_BODY - 400] + "\n\n... (shortened, see the run summary)\n"
+          body += f"\n{marker}\n"
+
+          # ---- job summary (all findings of all images) ------------------------------------------------------------------
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"## Scheduled image scan\n\n" + "\n".join(table) + "\n\n")
+              if errors:
+                  s.write("**Could not be scanned:** " + ", ".join(f"`{e['ref']}`" for e in errors) + "\n\n")
+              if skipped:
+                  s.write("Not scanned (third-party): " + ", ".join(f"`{x['ref']}`" for x in skipped) + "\n\n")
+              for img in images:
+                  r = results.get(img["key"])
+                  if not r or not r["findings"]:
+                      continue
+                  s.write(f"### {img['name']} `{img['digest'][7:19]}` ({img['envs']})\n\n| Severity | ID | Package | Installed | Fixed | Title |\n|---|---|---|---|---|---|\n")
+                  for f in r["findings"]:
+                      s.write(f"| {f['severity']} | {f['id']} | {cell(f['pkg'], 40)} | {cell(f['installed'], 30)} | {cell(f['fixed'] or '-', 30)} | {cell(f['title'])} |\n")
+                  s.write("\n")
+              s.write(f"Result: {n_findings} finding(s), {len(errors)} image(s) not scanned.\n")
+
+
+          # ---- the one issue -----------------------------------------------------------------------------------------------
+          def gh(*args, check=True):
+              p = subprocess.run(["gh", *args], capture_output=True, text=True)
+              if check and p.returncode != 0:
+                  sys.exit(f"gh {' '.join(args[:3])} failed: {p.stderr.strip()}")
+              return p.stdout
+
+
+          listing = json.loads(gh("issue", "list", "--state", "all", "--label", LABEL, "--limit", "100",
+                                  "--json", "number,title,state,body") or "[]")
+          mine = [i for i in listing if i["title"] == TITLE]
+          mine.sort(key=lambda i: (i["state"] != "OPEN", -i["number"]))   # an open one first, else the newest closed one
+          issue = mine[0] if mine else None
+          old_fp = None
+          if issue:
+              m = re.search(r"<!-- scan-fingerprint:([0-9a-f]+) -->", issue["body"] or "")
+              old_fp = m.group(1) if m else None
+
+          summary = f"{n_findings} finding(s) ({total['CRITICAL']} critical, {total['HIGH']} high)"
+          if errors:
+              summary += f", {len(errors)} image(s) not scanned"
+          if not images:
+              summary = "no image digests found"
+
+          if os.environ.get("DRY_RUN") == "true":
+              print("DRY RUN", json.dumps({"issue": issue and issue["number"], "problem": problem, "fp": fp, "old_fp": old_fp}))
+              print(body)
+          elif problem:
+              gh("label", "create", LABEL, "--color", "D93F0B", "--description", "Findings of the scheduled security scans", "--force", check=False)
+              with open("body.md", "w") as f:
+                  f.write(body)
+              if issue is None:
+                  url = gh("issue", "create", "--title", TITLE, "--label", LABEL, "--body-file", "body.md").strip()
+                  print(f"created {url}")
+              else:
+                  num = str(issue["number"])
+                  gh("issue", "edit", num, "--body-file", "body.md")
+                  if issue["state"] != "OPEN":
+                      gh("issue", "reopen", num, "--comment", f"Reopened by the scan of {now}: {summary}. [Run]({run_url})")
+                  elif old_fp != fp:
+                      gh("issue", "comment", num, "--body", f"The findings changed in the scan of {now}: {summary}. [Run]({run_url})")
+                  print(f"updated #{num}")
+          elif issue is not None and issue["state"] == "OPEN":
+              num = str(issue["number"])
+              with open("body.md", "w") as f:
+                  f.write(body)
+              gh("issue", "edit", num, "--body-file", "body.md")
+              gh("issue", "close", num, "--reason", "completed", "--comment", f"Clean in the scan of {now}: no HIGH or CRITICAL findings. [Run]({run_url})")
+              print(f"closed #{num}")
+          else:
+              print("clean, no open issue")
+
+          with open(os.environ.get("GITHUB_OUTPUT", os.devnull), "a") as f:
+              f.write(f"problem={'true' if problem else 'false'}\n")
+          PY
+          python3 "$RUNNER_TEMP/report.py"
+
+      - name: Fail on findings (only when asked for)
+        if: steps.report.outputs.problem == 'true' && env.FAIL_ON_FINDINGS == 'true'
+        run: |
+          echo "::error::the scan has findings (fail-on-findings is set); see the issue and the job summary"
+          exit 1

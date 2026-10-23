@@ -1,7 +1,7 @@
 # platform-demo-workflows
 
 Reusable GitHub Actions workflows shared by the platform-demo repositories. Services call these instead of carrying their own
-copy of a 300-line pipeline, so a fix or a version bump lands once. Current release: **v3.0.3** (history below). Callers pin the release they use by commit SHA: the developer portal calls v3.0.3; the ten service repositories still pin v2.0.2 until they are re-pinned (the Docker workflows are unchanged between the two).
+copy of a 300-line pipeline, so a fix or a version bump lands once. Current release: **v3.1.0** (history below). Callers pin the release they use by commit SHA: the developer portal calls v3.0.3; the ten service repositories still pin v2.0.2 until they are re-pinned (the Docker workflows are unchanged between the two).
 
 | Workflow | Purpose | Used by |
 |---|---|---|
@@ -14,6 +14,11 @@ copy of a 300-line pipeline, so a fix or a version bump lands once. Current rele
 | [`docker-promote.yaml`](.github/workflows/docker-promote.yaml) | copy the scanned digest to Docker Hub (no rebuild), tag, cosign-sign, self-verify, attach the SBOM as a signed `spdxjson` attestation, self-verify; refuses commits not on `main` | every service |
 | [`secret-scan.yaml`](.github/workflows/secret-scan.yaml) | stand-alone gitleaks scan (the pull request's commits; full history on manual runs) | helm, observability, product-catalog-db |
 | [`workflow-lint.yaml`](.github/workflows/workflow-lint.yaml) | actionlint (+ shellcheck on CI runners) and "every `uses:` is pinned to a full commit SHA" | every repo (this one included) |
+| [`gitops-promote.yaml`](.github/workflows/gitops-promote.yaml) | changes only `image.tag` and `image.digest` of one app in one environment of platform-demo-helm through a pull request (GitHub App token scoped to the helm repo, branch `promote/<app>/<env>` force-updated so a newer build replaces an older open one, squash auto-merge); idempotent | app publish workflows (dev), helm `Promote` (stage, prod) |
+| [`gitops-rollback.yaml`](.github/workflows/gitops-rollback.yaml) | moves an app back or forward to a digest that was deployed before (`previous`, `latest`, a digest or a helm commit) through a pull request (`rollback/<app>/<env>`, label `rollback`) that passes the same gates | helm `Rollback` |
+| [`scheduled-image-scan.yaml`](.github/workflows/scheduled-image-scan.yaml) | weekly Trivy scan of every deployed image digest (Monday 08:00 UTC); SARIF to the Security tab and one updated issue "Scheduled image scan" | helm `Scheduled scans` |
+| [`scheduled-code-scan.yaml`](.github/workflows/scheduled-code-scan.yaml) | weekly SCA and SAST of the default branch of the services, the portal and the plugins (own cron, Monday 08:00 UTC); one updated issue "Scheduled code scan" | this repository |
+| [`ghcr-prune.yaml`](.github/workflows/ghcr-prune.yaml) | keeps the newest N `sha-*` versions of a ghcr.io staging package, protects image-index children, `dry-run` supported | app publish workflows |
 | [`terraform-ci.yaml`](.github/workflows/terraform-ci.yaml) | `fmt` + `validate`, TFLint, Trivy config scan, Checkov, Infracost monthly estimate (needs a free `INFRACOST_API_KEY`), `terraform plan` as a PR comment (no refresh, never touches the running platform) | infra-terraform |
 | [`terraform-plan.yaml`](.github/workflows/terraform-plan.yaml) | plans a root module (or its destruction), saves the plan encrypted in the state bucket (7 days), shows the reason and the changes on the run page; changes nothing | infra-terraform |
 | [`terraform-apply.yaml`](.github/workflows/terraform-apply.yaml) | **Review** job (checks the saved plan belongs to this commit, is recent and unaltered; shows reason, an "at a glance" summary computed by script with anything destroyed or replaced first, and the plan), then an **Apply** job in a GitHub environment that waits for a reviewer and applies exactly the reviewed plan. Also runs destroy plans, with optional before/after scripts | infra-terraform |
@@ -110,6 +115,7 @@ required checks taken from a repo's last green PR, squash-only merges, secret sc
 | v3.0.1 | `terraform-ci`: the plan and cost jobs read their variables correctly (a stray `}` broke them) |
 | v3.0.2 | `terraform-ci`: variables are shell-quoted when loaded for the plan and cost jobs (a JSON list lost its double quotes) |
 | v3.0.3 | Trivy is set to v0.76.1 explicitly in the three scan steps (`docker-build`, `java-gradle-ci`, `terraform-ci`) instead of the action's older default (0.70.0), so it is bumped in one reviewed place |
+| v3.1.0 | every job has a `timeout-minutes`; the language workflows run all their jobs in parallel; one generated secret-scan implementation (shallow, scans the pull request's commits); `changed-paths.yaml` (docs-only change filter); registry build cache on ghcr.io instead of `type=gha`; `docker-promote` gets `sha-only`, outputs and retries on the cosign lookups; new `gitops-promote`, `gitops-rollback`, `scheduled-image-scan`, `scheduled-code-scan`, `ghcr-prune` and `tools/check-repo-settings.sh` (read-only settings drift check) |
 
 ## The Terraform workflows
 

@@ -12,3 +12,22 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/workflow-lint.yaml
+
+  # The generated workflows are what the generator writes, every job has permissions and a timeout, and service-ci passes its
+  # inputs to the language workflows with the same defaults (tools/check-consistency.py).
+  consistency:
+    name: Generated files and conventions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install PyYAML
+        run: pip install --quiet "pyyaml==6.0.2"
+
+      - name: Check
+        run: python3 tools/check-consistency.py

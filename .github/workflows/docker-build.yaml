@@ -4,6 +4,8 @@ name: Docker build and scan
 #   1. build - build once, push to ghcr.io (staging) and record the digest
 #   2. scan  - Trivy (HIGH/CRITICAL fail) on that exact digest
 # Nothing is published to Docker Hub here; see docker-promote.yaml for that.
+# Build cache: a registry cache on ghcr.io (ghcr.io/<repo>/buildcache). Every build READS it (so pull requests from forks, which
+# cannot write packages, still work); only a caller that passes `cache-write: true` (service-publish, on main) WRITES it.
 # Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/docker-build.yaml@<tag or sha>
 
 on:
@@ -19,6 +21,10 @@ on:
         description: Path to a .trivyignore file in the caller repo (optional)
         type: string
         default: ""
+      cache-write:
+        description: Also write the registry build cache ghcr.io/<repo>/buildcache (mode=max). Only for runs on main; every build reads it.
+        type: boolean
+        default: false
     outputs:
       staged-image:
         description: ghcr.io reference (by digest) that was scanned
@@ -34,6 +40,7 @@ jobs:
   build:
     name: Build & Stage Image (ghcr.io)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
@@ -63,6 +70,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      - name: Name the registry build cache
+        id: cache
+        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY,,}/buildcache" >> "$GITHUB_OUTPUT"
+
       - name: Build and push to ghcr.io (staging)
         id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -72,18 +83,19 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=${{ steps.cache.outputs.ref }}
+          cache-to: ${{ inputs.cache-write && format('type=registry,ref={0},mode=max,image-manifest=true,oci-mediatypes=true', steps.cache.outputs.ref) || '' }}
 
       - name: Record the staged image reference (by digest)
         id: image-ref
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
-        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY}@${DIGEST}" >> "$GITHUB_OUTPUT"
+        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY,,}@${DIGEST}" >> "$GITHUB_OUTPUT"
 
   scan-image:
     name: Scan Image for CVEs
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [build]
     permissions:
       contents: read

@@ -58,6 +58,7 @@ jobs:
   validate:
     name: Format and validate
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -84,6 +85,7 @@ jobs:
   tflint:
     name: TFLint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -103,6 +105,7 @@ jobs:
   trivy:
     name: Trivy config scan
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -122,6 +125,7 @@ jobs:
   checkov:
     name: Checkov
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -142,6 +146,7 @@ jobs:
     name: Cost estimate
     if: inputs.cost_directory != ''
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: write
@@ -196,6 +201,7 @@ jobs:
     # Pull requests from the same repository only: a fork must never get AWS access.
     if: inputs.plan_directory != '' && inputs.state_bucket != '' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       pull-requests: write

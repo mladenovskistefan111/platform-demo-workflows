@@ -1,0 +1,505 @@
+name: GitOps promote
+
+# Changes the image of ONE app in ONE environment of platform-demo-helm through a pull request, and never anywhere else:
+#
+#   envs/<env>/values/<app>.yaml   image.tag + image.digest (+ a `# vX.Y.Z` comment on the digest line for releases)
+#
+# It is the only way an image reaches a cluster. Callers: an app repository's publish workflow (env = dev, automatic) and the helm
+# repository's Promote workflow (env = stage or prod, started by a person).
+#
+#   1. a GitHub App installation token is minted, scoped to platform-demo-helm only, valid for the job;
+#   2. helm `main` is checked out and only image.tag / image.digest are edited (comments and formatting stay);
+#   3. the branch `promote/<app>/<env>` is force-updated, so a newer build REPLACES an older open promotion instead of piling up PRs;
+#   4. the pull request to `main` is opened or updated and squash auto-merge is enabled: it merges when helm's required checks pass.
+#
+# Idempotent: the digest that is already in the file means nothing happens (an open, now stale, promotion is closed). A run for a
+# source commit that is OLDER than the one in the open promotion does not replace it.
+#
+# Call it with (the caller's job needs no permissions; do NOT give the caller job a `concurrency` group of its own with the name below):
+#   uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@<sha> # <tag>
+#   secrets:
+#     PROMOTE_APP_ID: ${{ secrets.PROMOTE_APP_ID }}
+#     PROMOTE_APP_PRIVATE_KEY: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: Chart directory name = values file name, e.g. checkout-service
+        type: string
+        required: true
+      env:
+        description: dev, stage or prod
+        type: string
+        required: true
+      image-tag:
+        description: Image tag that was published, e.g. sha-1a2b3c4 (informational; the digest is what deploys)
+        type: string
+        required: true
+      image-digest:
+        description: sha256:... digest of the published image
+        type: string
+        required: true
+      source-repository:
+        description: Repository the change comes from, e.g. platform-boutique/app-checkout-service (shown in the pull request)
+        type: string
+        required: true
+      source-sha:
+        description: Full commit SHA in source-repository that produced the image
+        type: string
+        required: true
+      version:
+        description: Release version X.Y.Z recorded next to the digest (stage and prod only; empty = none)
+        type: string
+        default: ""
+      auto-merge:
+        description: Enable squash auto-merge on the pull request
+        type: boolean
+        default: true
+    secrets:
+      PROMOTE_APP_ID:
+        required: true
+      PROMOTE_APP_PRIVATE_KEY:
+        required: true
+    outputs:
+      pr-url:
+        description: URL of the pull request (empty when nothing had to change)
+        value: ${{ jobs.promote.outputs.pr-url }}
+      pr-number:
+        description: Number of the pull request (empty when nothing had to change)
+        value: ${{ jobs.promote.outputs.pr-number }}
+
+permissions: {}
+
+# One run at a time per app and environment. Nothing is cancelled midway (a half-done branch update would be worse than waiting);
+# a run that is still waiting is replaced by a newer waiting one, which is what we want: the newest build wins.
+concurrency:
+  group: gitops-promote-${{ inputs.app }}-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.app }} to ${{ inputs.env }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The work is done with the App token; the job's own token needs nothing (it only reads public repositories for a comparison).
+    permissions: {}
+    env:
+      APP: ${{ inputs.app }}
+      TARGET_ENV: ${{ inputs.env }}
+      IMAGE_TAG: ${{ inputs.image-tag }}
+      IMAGE_DIGEST: ${{ inputs.image-digest }}
+      SOURCE_REPO: ${{ inputs.source-repository }}
+      SOURCE_SHA: ${{ inputs.source-sha }}
+      VERSION: ${{ inputs.version }}
+      AUTO_MERGE: ${{ inputs.auto-merge }}
+      REPO: platform-boutique/platform-demo-helm
+    outputs:
+      pr-url: ${{ steps.publish.outputs.pr-url }}
+      pr-number: ${{ steps.publish.outputs.pr-number }}
+    steps:
+      - name: Check the inputs
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$APP" =~ ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$ ]] || fail "app '$APP' is not a chart name (lowercase letters, digits, dashes)."
+          case "$TARGET_ENV" in dev | stage | prod) ;; *) fail "env must be dev, stage or prod (got '$TARGET_ENV')." ;; esac
+          [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]] || fail "image-tag '$IMAGE_TAG' is not a valid image tag."
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "image-digest must be sha256:<64 hex> (got '$IMAGE_DIGEST')."
+          [[ "$SOURCE_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || fail "source-repository must be owner/name."
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "source-sha must be a full 40-character commit SHA."
+          if [ -n "$VERSION" ]; then
+            [ "$TARGET_ENV" != dev ] || fail "a version is recorded in stage and prod only, not in dev."
+            [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail "version must be X.Y.Z (got '$VERSION')."
+          fi
+          BRANCH="promote/$APP/$TARGET_ENV"
+          { echo "BRANCH=$BRANCH"; echo "GITOPS_DIR=$RUNNER_TEMP/gitops"; } >> "$GITHUB_ENV"
+          echo "Promote $APP to $TARGET_ENV: $IMAGE_TAG ($IMAGE_DIGEST), source $SOURCE_REPO@$SOURCE_SHA, branch $BRANCH"
+
+      - name: Install the helpers
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITOPS_DIR/pr"
+          cat > "$GITOPS_DIR/common.py" <<'PYEOF'
+          # ---- values-file helpers (the same text is in gitops-promote.yaml and gitops-rollback.yaml) ----
+          import re
+
+          VERSION_COMMENT = re.compile(r"#\s*v(\d+\.\d+\.\d+)")
+          DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+          CHILD_RE = re.compile(
+              r"^(?P<ind> +)(?P<key>tag|digest):(?P<sp>[ \t]*)"
+              r"(?P<val>\"[^\"]*\"|'[^']*'|[^\s#\"']*)(?P<rest>[ \t]*(?:#.*)?)$"
+          )
+
+
+          def image_block(lines):
+              """Locate the block-style top-level `image:` key. Returns (start, last_child, indent, {key: line index})."""
+              start = next((i for i, l in enumerate(lines) if re.match(r"^image:[ \t]*(#.*)?$", l.rstrip("\n"))), None)
+              if start is None:
+                  raise ValueError("no block-style top-level 'image:' key (flow style 'image: {...}' is not supported)")
+              indent, last, found = None, start, {}
+              for j in range(start + 1, len(lines)):
+                  l = lines[j].rstrip("\n")
+                  if not l.strip() or l.lstrip().startswith("#"):
+                      continue
+                  n = len(l) - len(l.lstrip(" "))
+                  if n == 0:
+                      break
+                  if indent is None:
+                      indent = n
+                  if n >= indent:
+                      last = j
+                  m = CHILD_RE.match(l)
+                  if m and n == indent:
+                      found[m.group("key")] = j
+              return start, last, indent or 2, found
+
+
+          def unquote(v):
+              return v[1:-1] if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" else v
+
+
+          def read_image(text):
+              """-> {'tag': str, 'digest': str, 'version': str}; empty strings when absent."""
+              if "\r" in text:
+                  raise ValueError("CRLF line endings are not supported")
+              lines = text.splitlines(keepends=True)
+              try:
+                  _, _, _, found = image_block(lines)
+              except ValueError:
+                  return {"tag": "", "digest": "", "version": ""}
+              out = {"tag": "", "digest": "", "version": ""}
+              for key, i in found.items():
+                  m = CHILD_RE.match(lines[i].rstrip("\n"))
+                  out[key] = unquote(m.group("val"))
+                  if key == "digest":
+                      v = VERSION_COMMENT.fullmatch(m.group("rest").strip())
+                      out["version"] = v.group(1) if v else ""
+              return out
+
+
+          def set_image(text, tag, digest, version):
+              """Return `text` with image.tag / image.digest (and the `# vX.Y.Z` comment on the digest line) replaced.
+
+              Everything else (comments, order, quoting, other keys) is left byte for byte as it was. tag == "" removes the tag line
+              (an unknown tag must not stay behind); version == "" removes a stale `# vX.Y.Z` comment."""
+              if "\r" in text:
+                  raise ValueError("CRLF line endings are not supported")
+              if not DIGEST_RE.match(digest):
+                  raise ValueError(f"not a digest: {digest!r}")
+              lines = text.splitlines(keepends=True)
+              if lines and not lines[-1].endswith("\n"):
+                  lines[-1] += "\n"
+              start, last, indent, found = image_block(lines)
+              pad = " " * indent
+
+              # digest line
+              comment = ""
+              if "digest" in found:
+                  i = found["digest"]
+                  m = CHILD_RE.match(lines[i].rstrip("\n"))
+                  q = m.group("val")[:1] if m.group("val")[:1] in "\"'" else ""
+                  old_comment = m.group("rest").strip()
+                  foreign = old_comment and not VERSION_COMMENT.fullmatch(old_comment)
+                  if version:
+                      if foreign:
+                          raise ValueError(f"image.digest carries the comment {old_comment!r}; remove it by hand before recording a version")
+                      comment = f"   # v{version}"
+                  elif foreign:
+                      comment = "   " + old_comment
+                  lines[i] = f"{pad}digest:{m.group('sp') or ' '}{q}{digest}{q}{comment}\n"
+              else:
+                  comment = f"   # v{version}" if version else ""
+                  i = last + 1
+                  lines.insert(i, f"{pad}digest: {digest}{comment}\n")
+                  found = {k: (v + 1 if v >= i else v) for k, v in found.items()}
+                  found["digest"] = i
+
+              # tag line
+              if tag:
+                  if "tag" in found:
+                      j = found["tag"]
+                      m = CHILD_RE.match(lines[j].rstrip("\n"))
+                      q = m.group("val")[:1] if m.group("val")[:1] in "\"'" else ""
+                      lines[j] = f"{pad}tag:{m.group('sp') or ' '}{q}{tag}{q}{m.group('rest')}\n"
+                  else:
+                      lines.insert(found["digest"], f"{pad}tag: {tag}\n")
+              elif "tag" in found:
+                  del lines[found["tag"]]
+              return "".join(lines)
+          # ---- end of values-file helpers ----
+          PYEOF
+          cat > "$GITOPS_DIR/prlib.sh" <<'SHEOF'
+          # Helpers for the pull-request steps (the same text is in gitops-promote.yaml and gitops-rollback.yaml).
+          # Needs: GH_TOKEN (the GitHub App token), REPO (owner/repo of the helm repository).
+          open_pr_number() { # $1 = branch -> number of the open PR from that branch (empty when none)
+            gh api "repos/$REPO/pulls?state=open&head=${REPO%%/*}:$1&per_page=1" --jq '.[0].number // empty'
+          }
+          close_pr_on_branch() { # $1 = branch, $2 = comment: close the open PR from that branch and delete the branch
+            local n
+            n=$(open_pr_number "$1")
+            [ -n "$n" ] || return 0
+            gh api -X POST "repos/$REPO/issues/$n/comments" -f body="$2" > /dev/null
+            gh api -X PATCH "repos/$REPO/pulls/$n" -f state=closed > /dev/null
+            gh api -X DELETE "repos/$REPO/git/refs/heads/$1" > /dev/null || true
+            echo "Closed #$n (branch $1)."
+          }
+          SHEOF
+
+      # Short-lived (1 hour at most, revoked when the job ends), limited to ONE repository and two permissions.
+      - name: Create a GitHub App token (platform-demo-helm only)
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.PROMOTE_APP_ID }}
+          private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+          owner: platform-boutique
+          repositories: platform-demo-helm
+          permission-contents: write
+          permission-pull-requests: write
+
+      # The checkout step keeps the token for the push in a runner-local credential file; the runner is discarded after the job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: platform-boutique/platform-demo-helm
+          ref: main
+          path: helm
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+
+      - name: Edit the values file
+        id: edit
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, os.path.join(os.environ["RUNNER_TEMP"], "gitops"))
+          from common import read_image, set_image
+
+          app, env = os.environ["APP"], os.environ["TARGET_ENV"]
+          tag, digest, version = os.environ["IMAGE_TAG"], os.environ["IMAGE_DIGEST"], os.environ["VERSION"]
+
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+
+          rel = f"envs/{env}/values/{app}.yaml"
+          path = f"helm/{rel}"
+          if not os.path.isfile(path):
+              fail(f"{rel} does not exist in platform-demo-helm. A promotion only changes the image of an existing values file; "
+                   f"create the file first (copy it from the previous environment) in a normal pull request.")
+          text = open(path, encoding="utf-8").read()
+          try:
+              cur = read_image(text)
+              if not cur["digest"]:
+                  fail(f"{rel} has no image.digest (block style `image:` with a `digest:` line is required).")
+              if cur["digest"] == digest:
+                  if version and cur["version"] and cur["version"] != version:
+                      fail(f"{app} in {env} already is this digest as version {cur['version']}; a digest keeps the version it was first given "
+                           f"(asked for {version}).")
+                  changed = bool(version) and not cur["version"]
+              else:
+                  changed = True
+              if changed:
+                  new = set_image(text, tag, digest, version)
+                  open(path, "w", encoding="utf-8").write(new)
+          except ValueError as e:
+              fail(f"{rel}: {e}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"changed={'true' if changed else 'false'}\n")
+              out.write(f"old-digest={cur['digest']}\n")
+              out.write(f"old-tag={cur['tag']}\n")
+              out.write(f"old-version={cur['version']}\n")
+              out.write(f"file={rel}\n")
+          print(("Updated " if changed else "Already up to date: ") + rel)
+          PY
+
+      - name: A release version is used once
+        if: steps.edit.outputs.changed == 'true' && env.VERSION != '' && env.TARGET_ENV == 'stage'
+        working-directory: helm
+        run: |
+          # The release is made after the merge (helm repository: stage-release.yaml), as <app>-vX.Y.Z. Refuse a name that is taken.
+          if git ls-remote --exit-code --tags origin "refs/tags/$APP-v$VERSION" > /dev/null 2>&1; then
+            echo "::error::Version $VERSION of $APP already exists as the tag $APP-v$VERSION in platform-demo-helm. Choose the next version."
+            exit 1
+          fi
+
+      - name: Do not replace a newer open promotion
+        id: guard
+        if: steps.edit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PUBLIC_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$GITOPS_DIR/prlib.sh"
+          # A re-run of an old build must never replace a newer open promotion. If a promotion for this app and environment is open and it
+          # came from the same repository, only go on when the new source commit is not behind the one in the open PR.
+          number=$(open_pr_number "$BRANCH")
+          [ -n "$number" ] || { echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          body=$(gh api "repos/$REPO/pulls/$number" --jq '.body // ""')
+          marker=$(grep -oE 'gitops-promote: source-repository=[^ ]+ source-sha=[0-9a-f]{40}' <<< "$body" | head -n1 || true)
+          skip=false
+          if [ -n "$marker" ]; then
+            old_repo=${marker#*source-repository=}; old_repo=${old_repo%% *}
+            old_sha=${marker##*source-sha=}
+            if [ "$old_repo" = "$SOURCE_REPO" ] && [ "$old_sha" != "$SOURCE_SHA" ]; then
+              status=$(GH_TOKEN="$PUBLIC_TOKEN" gh api "repos/$SOURCE_REPO/compare/$old_sha...$SOURCE_SHA" --jq .status 2> /dev/null || echo unknown)
+              echo "Open promotion #$number is from $old_sha; the new source $SOURCE_SHA is '$status' relative to it."
+              if [ "$status" = "behind" ]; then
+                skip=true
+                echo "::notice::Not replacing #$number: $SOURCE_SHA is older than the commit it was made from ($old_sha)."
+              fi
+            fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+      - name: Write the pull request text
+        if: steps.edit.outputs.changed == 'true' && steps.guard.outputs.skip != 'true'
+        env:
+          OLD_DIGEST: ${{ steps.edit.outputs.old-digest }}
+          OLD_TAG: ${{ steps.edit.outputs.old-tag }}
+          FILE: ${{ steps.edit.outputs.file }}
+        run: |
+          set -euo pipefail
+          d="$GITOPS_DIR/pr"
+          mkdir -p "$d"
+          suffix=""
+          version_cell="none (not a release)"
+          if [ -n "$VERSION" ]; then
+            suffix=" (v$VERSION)"
+            version_cell="\`$VERSION\`"
+          fi
+          printf 'promote(%s): %s %s%s\n' "$TARGET_ENV" "$APP" "$IMAGE_TAG" "$suffix" > "$d/title.txt"
+          {
+            cat "$d/title.txt"
+            echo
+            echo "Image: $IMAGE_DIGEST (was $OLD_DIGEST)"
+            echo "Source: $SOURCE_REPO@$SOURCE_SHA"
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$d/commit-message.txt"
+          {
+            echo "## Promote \`$APP\` to \`$TARGET_ENV\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| App | \`$APP\` |"
+            echo "| Environment | \`$TARGET_ENV\` |"
+            echo "| Version | $version_cell |"
+            echo "| Image tag | \`$IMAGE_TAG\`${OLD_TAG:+ (was \`$OLD_TAG\`)} |"
+            echo "| Digest, old | \`${OLD_DIGEST}\` |"
+            echo "| Digest, new | \`${IMAGE_DIGEST}\` |"
+            echo "| Source commit | [\`${SOURCE_SHA:0:7}\`]($GITHUB_SERVER_URL/$SOURCE_REPO/commit/$SOURCE_SHA) in \`$SOURCE_REPO\` |"
+            echo "| Run | [$GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) (\`$GITHUB_REPOSITORY\`) |"
+            echo
+            echo "Only \`image.tag\` and \`image.digest\` in \`$FILE\` change. The digest is never rebuilt on the way: it is the one that was built, scanned and signed once."
+            echo "The branch \`$BRANCH\` is shared by all promotions of this app to this environment: a newer one replaces this pull request's content."
+            if [ "$AUTO_MERGE" = "true" ]; then
+              echo "Squash auto-merge is enabled: it merges when the required checks (promotion policy, cosign gate, render and policy tests) pass. Nothing is bypassed."
+            else
+              echo "Auto-merge is off for this pull request."
+            fi
+            echo
+            echo "<!-- gitops-promote: source-repository=$SOURCE_REPO source-sha=$SOURCE_SHA digest=$IMAGE_DIGEST -->"
+          } > "$d/body.md"
+
+      - name: Commit, push and open or update the pull request
+        id: publish
+        if: steps.edit.outputs.changed == 'true' && steps.guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          FILE: ${{ steps.edit.outputs.file }}
+          LABEL: promotion
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$GITOPS_DIR/prlib.sh"
+          cd helm
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch --quiet -C "$BRANCH"
+          git add -- "$FILE"
+          git commit --quiet -F "$GITOPS_DIR/pr/commit-message.txt"
+          # One branch per app+environment, force-updated: a newer change replaces an older open one. Skip the push when the branch
+          # already holds exactly this tree (a re-run), so CI is not started again for nothing.
+          local_tree=$(git rev-parse 'HEAD^{tree}')
+          remote_tree=""
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            git fetch --quiet --depth=1 origin "refs/heads/$BRANCH"
+            remote_tree=$(git rev-parse 'FETCH_HEAD^{tree}')
+          fi
+          if [ "$local_tree" = "$remote_tree" ]; then
+            echo "Branch $BRANCH already holds this change; not pushing again."
+          else
+            git push --quiet --force origin "HEAD:refs/heads/$BRANCH"
+          fi
+
+          title=$(cat "$GITOPS_DIR/pr/title.txt")
+          number=$(open_pr_number "$BRANCH")
+          if [ -n "$number" ]; then
+            gh api -X PATCH "repos/$REPO/pulls/$number" -f title="$title" -F body="@$GITOPS_DIR/pr/body.md" > /dev/null
+            echo "Updated pull request #$number."
+          else
+            number=$(gh api -X POST "repos/$REPO/pulls" -f title="$title" -f head="$BRANCH" -f base=main -F body="@$GITOPS_DIR/pr/body.md" --jq .number)
+            echo "Opened pull request #$number."
+          fi
+          url=$(gh api "repos/$REPO/pulls/$number" --jq .html_url)
+          if [ -n "$LABEL" ]; then
+            gh api -X POST "repos/$REPO/issues/$number/labels" -f "labels[]=$LABEL" > /dev/null
+          fi
+
+          if [ "$AUTO_MERGE" = "true" ]; then
+            # Squash auto-merge: merges when every required check (promotion-policy, cosign gate, ...) and review is satisfied. Nothing is bypassed.
+            if out=$(gh pr merge "$number" --repo "$REPO" --auto --squash 2>&1); then
+              echo "Auto-merge enabled."
+            elif grep -qi 'clean status' <<< "$out"; then
+              # Nothing is required of this PR, so there is nothing to wait for.
+              gh pr merge "$number" --repo "$REPO" --squash
+            else
+              echo "::error::Could not enable auto-merge on #$number: $out"
+              exit 1
+            fi
+          fi
+          {
+            echo "pr-number=$number"
+            echo "pr-url=$url"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice title=Pull request::$url"
+
+      - name: Nothing to change, or a newer promotion is open
+        if: steps.edit.outputs.changed != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OLD_DIGEST: ${{ steps.edit.outputs.old-digest }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$GITOPS_DIR/prlib.sh"
+          echo "main already has $IMAGE_DIGEST for $APP in $TARGET_ENV: nothing to do."
+          # An open promotion from this branch holds a different (older) digest; left alone it would later undo this state.
+          close_pr_on_branch "$BRANCH" "Closed: \`main\` already has \`$IMAGE_DIGEST\` for \`$APP\` in \`$TARGET_ENV\`, so this promotion is stale."
+
+      - name: Summary
+        env:
+          EDIT_CHANGED: ${{ steps.edit.outputs.changed }}
+          SKIP: ${{ steps.guard.outputs.skip }}
+          PR_URL: ${{ steps.publish.outputs.pr-url }}
+        run: |
+          changed=false
+          [ "$EDIT_CHANGED" = true ] && [ "$SKIP" != true ] && changed=true
+          {
+            echo "### GitOps promote: \`$APP\` to \`$TARGET_ENV\`"
+            echo
+            if [ "$changed" = true ]; then
+              echo "Pull request: $PR_URL"
+              echo
+              echo "- tag \`$IMAGE_TAG\`, digest \`$IMAGE_DIGEST\`${VERSION:+, version \`$VERSION\`}"
+              echo "- source: \`$SOURCE_REPO\` @ \`${SOURCE_SHA:0:7}\`"
+            elif [ "$SKIP" = true ]; then
+              echo "A newer promotion is already open; this older build did not replace it."
+            else
+              echo "Nothing to do: the digest is already in place."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

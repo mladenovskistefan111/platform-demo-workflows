@@ -1,0 +1,555 @@
+name: GitOps rollback
+
+# Moves ONE app in ONE environment of platform-demo-helm back (or forward again) to a digest that was deployed before, through a pull
+# request. It is an ordinary change: the pull request passes the same required checks as a promotion and nothing is bypassed.
+#
+#   to = previous   the digest this file had before its latest change (from the git history of main). Run again, it goes forward
+#                   again: `previous` simply undoes the latest change.
+#   to = latest     roll FORWARD to the newest change:
+#                     stage, prod  the digest that is in the previous environment on main now (stage <- dev, prod <- stage)
+#                     dev          the digest of the newest promotion on main; commits titled `rollback(...)` are skipped. This is
+#                                  the way back after a rollback. (Git history only: no registry is asked.)
+#   to = sha256:... an explicit digest. It must have been in a values file of this app before (same history), so a rollback never
+#                   introduces an unknown image.
+#   to = <git sha>  a commit of platform-demo-helm on main: the image of the app in this environment as it was then. Only the image
+#                   lines are restored.
+#
+# The branch is `rollback/<app>/<env>` (force-updated, labelled `rollback`), an open promotion from `promote/<app>/<env>` is closed
+# first when rolling back (so it cannot undo the rollback), and squash auto-merge is enabled.
+#
+# Call it with:
+#   uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-rollback.yaml@<sha> # <tag>
+#   secrets:
+#     PROMOTE_APP_ID: ${{ secrets.PROMOTE_APP_ID }}
+#     PROMOTE_APP_PRIVATE_KEY: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: Chart directory name = values file name, e.g. checkout-service
+        type: string
+        required: true
+      env:
+        description: dev, stage or prod
+        type: string
+        required: true
+      to:
+        description: previous (default), latest, a sha256:... digest, or a git SHA of platform-demo-helm
+        type: string
+        default: previous
+    secrets:
+      PROMOTE_APP_ID:
+        required: true
+      PROMOTE_APP_PRIVATE_KEY:
+        required: true
+    outputs:
+      pr-url:
+        description: URL of the pull request (empty when nothing had to change)
+        value: ${{ jobs.rollback.outputs.pr-url }}
+      pr-number:
+        description: Number of the pull request (empty when nothing had to change)
+        value: ${{ jobs.rollback.outputs.pr-number }}
+
+permissions: {}
+
+# Not the group of gitops-promote: a waiting rollback must never be replaced by a waiting promotion.
+concurrency:
+  group: gitops-rollback-${{ inputs.app }}-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Roll back ${{ inputs.app }} in ${{ inputs.env }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    env:
+      APP: ${{ inputs.app }}
+      TARGET_ENV: ${{ inputs.env }}
+      TO: ${{ inputs.to }}
+      AUTO_MERGE: "true" # a rollback always goes through the same gates and merges when they pass
+      REPO: platform-boutique/platform-demo-helm
+    outputs:
+      pr-url: ${{ steps.publish.outputs.pr-url }}
+      pr-number: ${{ steps.publish.outputs.pr-number }}
+    steps:
+      - name: Check the inputs
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$APP" =~ ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$ ]] || fail "app '$APP' is not a chart name (lowercase letters, digits, dashes)."
+          case "$TARGET_ENV" in dev | stage | prod) ;; *) fail "env must be dev, stage or prod (got '$TARGET_ENV')." ;; esac
+          case "$TO" in
+            previous | latest) ;;
+            sha256:*) [[ "$TO" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "'to' looks like a digest but is not sha256:<64 hex>." ;;
+            *) [[ "$TO" =~ ^[0-9a-f]{7,40}$ ]] || fail "'to' must be previous, latest, a sha256:... digest or a git SHA (got '$TO')." ;;
+          esac
+          BRANCH="rollback/$APP/$TARGET_ENV"
+          { echo "BRANCH=$BRANCH"; echo "GITOPS_DIR=$RUNNER_TEMP/gitops"; } >> "$GITHUB_ENV"
+          echo "Roll back $APP in $TARGET_ENV to '$TO' on branch $BRANCH"
+
+      - name: Install the helpers
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITOPS_DIR/pr"
+          cat > "$GITOPS_DIR/common.py" <<'PYEOF'
+          # ---- values-file helpers (the same text is in gitops-promote.yaml and gitops-rollback.yaml) ----
+          import re
+
+          VERSION_COMMENT = re.compile(r"#\s*v(\d+\.\d+\.\d+)")
+          DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+          CHILD_RE = re.compile(
+              r"^(?P<ind> +)(?P<key>tag|digest):(?P<sp>[ \t]*)"
+              r"(?P<val>\"[^\"]*\"|'[^']*'|[^\s#\"']*)(?P<rest>[ \t]*(?:#.*)?)$"
+          )
+
+
+          def image_block(lines):
+              """Locate the block-style top-level `image:` key. Returns (start, last_child, indent, {key: line index})."""
+              start = next((i for i, l in enumerate(lines) if re.match(r"^image:[ \t]*(#.*)?$", l.rstrip("\n"))), None)
+              if start is None:
+                  raise ValueError("no block-style top-level 'image:' key (flow style 'image: {...}' is not supported)")
+              indent, last, found = None, start, {}
+              for j in range(start + 1, len(lines)):
+                  l = lines[j].rstrip("\n")
+                  if not l.strip() or l.lstrip().startswith("#"):
+                      continue
+                  n = len(l) - len(l.lstrip(" "))
+                  if n == 0:
+                      break
+                  if indent is None:
+                      indent = n
+                  if n >= indent:
+                      last = j
+                  m = CHILD_RE.match(l)
+                  if m and n == indent:
+                      found[m.group("key")] = j
+              return start, last, indent or 2, found
+
+
+          def unquote(v):
+              return v[1:-1] if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" else v
+
+
+          def read_image(text):
+              """-> {'tag': str, 'digest': str, 'version': str}; empty strings when absent."""
+              if "\r" in text:
+                  raise ValueError("CRLF line endings are not supported")
+              lines = text.splitlines(keepends=True)
+              try:
+                  _, _, _, found = image_block(lines)
+              except ValueError:
+                  return {"tag": "", "digest": "", "version": ""}
+              out = {"tag": "", "digest": "", "version": ""}
+              for key, i in found.items():
+                  m = CHILD_RE.match(lines[i].rstrip("\n"))
+                  out[key] = unquote(m.group("val"))
+                  if key == "digest":
+                      v = VERSION_COMMENT.fullmatch(m.group("rest").strip())
+                      out["version"] = v.group(1) if v else ""
+              return out
+
+
+          def set_image(text, tag, digest, version):
+              """Return `text` with image.tag / image.digest (and the `# vX.Y.Z` comment on the digest line) replaced.
+
+              Everything else (comments, order, quoting, other keys) is left byte for byte as it was. tag == "" removes the tag line
+              (an unknown tag must not stay behind); version == "" removes a stale `# vX.Y.Z` comment."""
+              if "\r" in text:
+                  raise ValueError("CRLF line endings are not supported")
+              if not DIGEST_RE.match(digest):
+                  raise ValueError(f"not a digest: {digest!r}")
+              lines = text.splitlines(keepends=True)
+              if lines and not lines[-1].endswith("\n"):
+                  lines[-1] += "\n"
+              start, last, indent, found = image_block(lines)
+              pad = " " * indent
+
+              # digest line
+              comment = ""
+              if "digest" in found:
+                  i = found["digest"]
+                  m = CHILD_RE.match(lines[i].rstrip("\n"))
+                  q = m.group("val")[:1] if m.group("val")[:1] in "\"'" else ""
+                  old_comment = m.group("rest").strip()
+                  foreign = old_comment and not VERSION_COMMENT.fullmatch(old_comment)
+                  if version:
+                      if foreign:
+                          raise ValueError(f"image.digest carries the comment {old_comment!r}; remove it by hand before recording a version")
+                      comment = f"   # v{version}"
+                  elif foreign:
+                      comment = "   " + old_comment
+                  lines[i] = f"{pad}digest:{m.group('sp') or ' '}{q}{digest}{q}{comment}\n"
+              else:
+                  comment = f"   # v{version}" if version else ""
+                  i = last + 1
+                  lines.insert(i, f"{pad}digest: {digest}{comment}\n")
+                  found = {k: (v + 1 if v >= i else v) for k, v in found.items()}
+                  found["digest"] = i
+
+              # tag line
+              if tag:
+                  if "tag" in found:
+                      j = found["tag"]
+                      m = CHILD_RE.match(lines[j].rstrip("\n"))
+                      q = m.group("val")[:1] if m.group("val")[:1] in "\"'" else ""
+                      lines[j] = f"{pad}tag:{m.group('sp') or ' '}{q}{tag}{q}{m.group('rest')}\n"
+                  else:
+                      lines.insert(found["digest"], f"{pad}tag: {tag}\n")
+              elif "tag" in found:
+                  del lines[found["tag"]]
+              return "".join(lines)
+          # ---- end of values-file helpers ----
+          PYEOF
+          cat > "$GITOPS_DIR/prlib.sh" <<'SHEOF'
+          # Helpers for the pull-request steps (the same text is in gitops-promote.yaml and gitops-rollback.yaml).
+          # Needs: GH_TOKEN (the GitHub App token), REPO (owner/repo of the helm repository).
+          open_pr_number() { # $1 = branch -> number of the open PR from that branch (empty when none)
+            gh api "repos/$REPO/pulls?state=open&head=${REPO%%/*}:$1&per_page=1" --jq '.[0].number // empty'
+          }
+          close_pr_on_branch() { # $1 = branch, $2 = comment: close the open PR from that branch and delete the branch
+            local n
+            n=$(open_pr_number "$1")
+            [ -n "$n" ] || return 0
+            gh api -X POST "repos/$REPO/issues/$n/comments" -f body="$2" > /dev/null
+            gh api -X PATCH "repos/$REPO/pulls/$n" -f state=closed > /dev/null
+            gh api -X DELETE "repos/$REPO/git/refs/heads/$1" > /dev/null || true
+            echo "Closed #$n (branch $1)."
+          }
+          SHEOF
+
+      # Short-lived (1 hour at most, revoked when the job ends), limited to ONE repository and two permissions.
+      - name: Create a GitHub App token (platform-demo-helm only)
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.PROMOTE_APP_ID }}
+          private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+          owner: platform-boutique
+          repositories: platform-demo-helm
+          permission-contents: write
+          permission-pull-requests: write
+
+      # Full history: the target is found in the git history of main. The token stays in a runner-local credential file for the push.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: platform-boutique/platform-demo-helm
+          ref: main
+          path: helm
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+
+      - name: Find the target and edit the values file
+        id: edit
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+          sys.path.insert(0, os.path.join(os.environ["RUNNER_TEMP"], "gitops"))
+          from common import read_image, set_image
+
+          app, env, to = os.environ["APP"], os.environ["TARGET_ENV"], os.environ["TO"]
+          PREV_ENV = {"stage": "dev", "prod": "stage"}.get(env)
+          rel = f"envs/{env}/values/{app}.yaml"
+          os.chdir("helm")
+
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+
+          def git(*args, check=True):
+              r = subprocess.run(["git", *args], capture_output=True, text=True)
+              if check and r.returncode:
+                  fail(f"git {' '.join(args)} failed: {r.stderr.strip()}")
+              return r
+
+
+          def path_of(e):
+              return f"envs/{e}/values/{app}.yaml"
+
+
+          def blob(rev, p):
+              r = git("show", f"{rev}:{p}", check=False)
+              return r.stdout if r.returncode == 0 else None
+
+
+          def history(e):
+              """Commits of main that touched the values file of environment e, newest first, with the image fields at that commit."""
+              rows = []
+              for line in git("log", "--format=%H%x09%s", "HEAD", "--", path_of(e)).stdout.splitlines():
+                  sha, _, subject = line.partition("\t")
+                  t = blob(sha, path_of(e))
+                  info = read_image(t) if t is not None else {"tag": "", "digest": "", "version": ""}
+                  rows.append({"sha": sha, "subject": re.sub(r"[^\x20-\x7e]", "?", subject), "env": e, **info})
+              return rows
+
+
+          def changes(rows):
+              """The rows at which the digest changed (the row after it, i.e. the older one, has another digest)."""
+              out = []
+              for i, r in enumerate(rows):
+                  older = rows[i + 1]["digest"] if i + 1 < len(rows) else None
+                  if r["digest"] and r["digest"] != older:
+                      out.append(r)
+              return out
+
+
+          if not os.path.isfile(rel):
+              fail(f"{rel} does not exist in platform-demo-helm.")
+          text = open(rel, encoding="utf-8").read()
+          cur = read_image(text)
+          if not cur["digest"]:
+              fail(f"{rel} has no image.digest, so there is nothing to roll back from.")
+          own = history(env)
+          own_changes = changes(own)
+          prev_cur = None
+          if PREV_ENV:
+              t = blob("HEAD", path_of(PREV_ENV))
+              prev_cur = read_image(t) if t is not None else None
+
+
+          def meta_for(digest):
+              """tag / version a digest had when it was last seen in this app's values files (own environment first)."""
+              for e in [env] + [x for x in ("stage", "prod", "dev") if x != env]:
+                  rows = own if e == env else history(e)
+                  for r in rows:
+                      if r["digest"] == digest:
+                          return {"tag": r["tag"], "version": r["version"], "where": f"{e} at {r['sha'][:7]}"}
+              return None
+
+
+          target = None
+          how = ""
+          if to == "previous":
+              row = next((r for r in own_changes if r["digest"] != cur["digest"]), None)
+              if row is None:
+                  fail(f"{rel} has no earlier digest in the history of main: there is nothing to go back to.")
+              target = {**row, "where": f"{env} at {row['sha'][:7]}"}
+              how = (f"`previous`: the digest this file had before it changed to the current one (commit `{row['sha'][:7]}`: {row['subject']})."
+                     " Running `previous` again after a rollback goes forward again; `latest` always means the newest change.")
+          elif to == "latest":
+              if PREV_ENV:
+                  if not prev_cur or not prev_cur["digest"]:
+                      fail(f"{path_of(PREV_ENV)} has no image.digest: `latest` for {env} is the digest currently in {PREV_ENV}.")
+                  target = {"tag": prev_cur["tag"], "digest": prev_cur["digest"], "version": prev_cur["version"], "where": f"{PREV_ENV} now"}
+                  how = f"`latest`: the digest that is in `{PREV_ENV}` on main now (a promotion to `{env}` takes the same one)."
+                  if not target["version"]:
+                      m = meta_for(target["digest"])
+                      target["version"] = (m or {}).get("version", "")
+              else:
+                  # dev has no earlier environment: the newest digest a promotion (not a rollback) put on main.
+                  row = next((r for r in own_changes if not r["subject"].startswith("rollback(")), None)
+                  if row is None:
+                      fail(f"Found no promotion in the history of {rel}; cannot tell what `latest` is. Give an explicit digest.")
+                  target = {**row, "where": f"dev at {row['sha'][:7]}"}
+                  how = (f"`latest`: the digest of the newest promotion on main (commit `{row['sha'][:7]}`: {row['subject']}); "
+                         "commits titled `rollback(...)` are skipped. This is the roll-forward after a rollback.")
+          elif re.fullmatch(r"sha256:[0-9a-f]{64}", to):
+              m = meta_for(to)
+              if m is None:
+                  fail(f"{to} never appeared in any values file of {app} in the history of main. A rollback only moves between digests "
+                       "that were deployed before; a new image goes through the publish pipeline (dev) and Promote (stage, prod).")
+              target = {"tag": m["tag"], "digest": to, "version": m["version"], "where": m["where"]}
+              how = f"explicit digest (last seen in {m['where']})."
+          elif re.fullmatch(r"[0-9a-f]{7,40}", to):
+              r = git("rev-parse", "--verify", "--quiet", f"{to}^{{commit}}", check=False)
+              if r.returncode:
+                  fail(f"'{to}' is not a commit of platform-demo-helm (is the history complete?).")
+              full = r.stdout.strip()
+              if git("merge-base", "--is-ancestor", full, "HEAD", check=False).returncode:
+                  fail(f"{full[:7]} is not on main; only commits of main can be rolled back to.")
+              t = blob(full, rel)
+              info = read_image(t) if t is not None else None
+              if not info or not info["digest"]:
+                  fail(f"{rel} had no image.digest at {full[:7]}.")
+              target = {**info, "where": f"{env} at {full[:7]}"}
+              how = f"helm commit `{full[:7]}`: the image of {app} in {env} as it was then (only the image lines are restored, nothing else in the file)."
+          else:
+              fail(f"'to' must be previous, latest, a sha256:... digest or a helm commit SHA (got '{to}').")
+
+          if env != "dev":
+              allowed = {r["digest"] for r in own}
+              if prev_cur:
+                  allowed.add(prev_cur["digest"])
+              if target["digest"] not in allowed:
+                  fail(f"{target['digest']} is neither in the history of {rel} nor the digest currently in {PREV_ENV}; "
+                       f"helm's promotion policy would refuse it. Promote it through {PREV_ENV} first.")
+
+          changed = target["digest"] != cur["digest"]
+          if changed:
+              try:
+                  open(rel, "w", encoding="utf-8").write(set_image(text, target["tag"], target["digest"], target["version"]))
+              except ValueError as e:
+                  fail(f"{rel}: {e}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"changed={'true' if changed else 'false'}\n")
+              out.write(f"file={rel}\n")
+              out.write(f"old-digest={cur['digest']}\n")
+              out.write(f"old-tag={cur['tag']}\n")
+              out.write(f"old-version={cur['version']}\n")
+              out.write(f"new-digest={target['digest']}\n")
+              out.write(f"new-tag={target['tag']}\n")
+              out.write(f"new-version={target['version']}\n")
+          with open(os.path.join(os.environ["GITOPS_DIR"], "how.txt"), "w") as f:
+              f.write(how)
+          print(f"{app}/{env}: {cur['digest']} -> {target['digest']} ({'change' if changed else 'no change'}); {how}")
+          PY
+
+      - name: Write the pull request text
+        if: steps.edit.outputs.changed == 'true'
+        env:
+          OLD_DIGEST: ${{ steps.edit.outputs.old-digest }}
+          OLD_TAG: ${{ steps.edit.outputs.old-tag }}
+          OLD_VERSION: ${{ steps.edit.outputs.old-version }}
+          NEW_DIGEST: ${{ steps.edit.outputs.new-digest }}
+          NEW_TAG: ${{ steps.edit.outputs.new-tag }}
+          NEW_VERSION: ${{ steps.edit.outputs.new-version }}
+          FILE: ${{ steps.edit.outputs.file }}
+        run: |
+          set -euo pipefail
+          d="$GITOPS_DIR/pr"
+          mkdir -p "$d"
+          what=${NEW_TAG:-${NEW_DIGEST:0:19}}
+          printf 'rollback(%s): %s to %s\n' "$TARGET_ENV" "$APP" "$what" > "$d/title.txt"
+          {
+            cat "$d/title.txt"
+            echo
+            echo "From: $OLD_DIGEST"
+            echo "To:   $NEW_DIGEST"
+            echo "Requested by: $GITHUB_ACTOR (to=$TO)"
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$d/commit-message.txt"
+          {
+            echo "## Roll \`$APP\` in \`$TARGET_ENV\` to \`$what\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| App | \`$APP\` |"
+            echo "| Environment | \`$TARGET_ENV\` |"
+            echo "| From | \`${OLD_DIGEST}\`${OLD_TAG:+ (tag \`$OLD_TAG\`)}${OLD_VERSION:+, version \`$OLD_VERSION\`} |"
+            echo "| To | \`${NEW_DIGEST}\`${NEW_TAG:+ (tag \`$NEW_TAG\`)}${NEW_VERSION:+, version \`$NEW_VERSION\`} |"
+            echo "| Requested by | \`$GITHUB_ACTOR\`, with \`to: $TO\` |"
+            echo "| Run | [$GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) |"
+            echo
+            echo "Target chosen: $(cat "$GITOPS_DIR/how.txt")"
+            echo
+            echo "Only \`image.tag\` and \`image.digest\` in \`$FILE\` change. This is an ordinary pull request: it passes the same required checks as any promotion (promotion policy, cosign gate, render and policy tests) and there is no bypass."
+            if [ "$AUTO_MERGE" = "true" ]; then
+              echo "Squash auto-merge is enabled."
+            else
+              echo "Auto-merge is off for this pull request."
+            fi
+            if [ "$TO" != latest ]; then
+              echo "An open promotion pull request for the same app and environment (\`promote/$APP/$TARGET_ENV\`) is closed so it cannot undo this rollback; the next publish brings newer builds again."
+            fi
+          } > "$d/body.md"
+
+      - name: Commit, push and open or update the pull request
+        id: publish
+        if: steps.edit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          FILE: ${{ steps.edit.outputs.file }}
+          LABEL: rollback
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$GITOPS_DIR/prlib.sh"
+          cd helm
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch --quiet -C "$BRANCH"
+          git add -- "$FILE"
+          git commit --quiet -F "$GITOPS_DIR/pr/commit-message.txt"
+          # One branch per app+environment, force-updated: a newer change replaces an older open one. Skip the push when the branch
+          # already holds exactly this tree (a re-run), so CI is not started again for nothing.
+          local_tree=$(git rev-parse 'HEAD^{tree}')
+          remote_tree=""
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            git fetch --quiet --depth=1 origin "refs/heads/$BRANCH"
+            remote_tree=$(git rev-parse 'FETCH_HEAD^{tree}')
+          fi
+          if [ "$local_tree" = "$remote_tree" ]; then
+            echo "Branch $BRANCH already holds this change; not pushing again."
+          else
+            git push --quiet --force origin "HEAD:refs/heads/$BRANCH"
+          fi
+
+          title=$(cat "$GITOPS_DIR/pr/title.txt")
+          number=$(open_pr_number "$BRANCH")
+          if [ -n "$number" ]; then
+            gh api -X PATCH "repos/$REPO/pulls/$number" -f title="$title" -F body="@$GITOPS_DIR/pr/body.md" > /dev/null
+            echo "Updated pull request #$number."
+          else
+            number=$(gh api -X POST "repos/$REPO/pulls" -f title="$title" -f head="$BRANCH" -f base=main -F body="@$GITOPS_DIR/pr/body.md" --jq .number)
+            echo "Opened pull request #$number."
+          fi
+          url=$(gh api "repos/$REPO/pulls/$number" --jq .html_url)
+          if [ -n "$LABEL" ]; then
+            gh api -X POST "repos/$REPO/issues/$number/labels" -f "labels[]=$LABEL" > /dev/null
+          fi
+
+          if [ "$AUTO_MERGE" = "true" ]; then
+            # Squash auto-merge: merges when every required check (promotion-policy, cosign gate, ...) and review is satisfied. Nothing is bypassed.
+            if out=$(gh pr merge "$number" --repo "$REPO" --auto --squash 2>&1); then
+              echo "Auto-merge enabled."
+            elif grep -qi 'clean status' <<< "$out"; then
+              # Nothing is required of this PR, so there is nothing to wait for.
+              gh pr merge "$number" --repo "$REPO" --squash
+            else
+              echo "::error::Could not enable auto-merge on #$number: $out"
+              exit 1
+            fi
+          fi
+          {
+            echo "pr-number=$number"
+            echo "pr-url=$url"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice title=Pull request::$url"
+
+      # A promotion that is still open for the same app and environment would merge on top of the rollback and undo it.
+      - name: Close the open promotion for this app and environment
+        if: steps.edit.outputs.changed == 'true' && inputs.to != 'latest'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.publish.outputs.pr-number }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$GITOPS_DIR/prlib.sh"
+          close_pr_on_branch "promote/$APP/$TARGET_ENV" "Closed: a rollback of \`$APP\` in \`$TARGET_ENV\` (#$PR_NUMBER) was requested; this promotion would undo it. The next publish or Promote run brings newer builds again."
+
+      - name: Nothing to change
+        if: steps.edit.outputs.changed != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$GITOPS_DIR/prlib.sh"
+          echo "$APP in $TARGET_ENV already has the requested digest: nothing to do."
+          close_pr_on_branch "$BRANCH" "Closed: \`main\` already has the requested digest for \`$APP\` in \`$TARGET_ENV\`."
+
+      - name: Summary
+        env:
+          CHANGED: ${{ steps.edit.outputs.changed }}
+          PR_URL: ${{ steps.publish.outputs.pr-url }}
+          OLD_DIGEST: ${{ steps.edit.outputs.old-digest }}
+          NEW_DIGEST: ${{ steps.edit.outputs.new-digest }}
+        run: |
+          {
+            echo "### GitOps rollback: \`$APP\` in \`$TARGET_ENV\` (to: \`$TO\`)"
+            echo
+            if [ "$CHANGED" = true ]; then
+              echo "Pull request: $PR_URL"
+              echo
+              echo "- from \`$OLD_DIGEST\`"
+              echo "- to \`$NEW_DIGEST\`"
+              echo "- $(cat "$GITOPS_DIR/how.txt")"
+            else
+              echo "Nothing to do: the requested digest is already in place."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
