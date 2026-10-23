@@ -1,0 +1,156 @@
+name: Service publish
+
+# The merge-to-main pipeline of every app repository, defined once. The caller is a 20-line file (tools/gen-callers.py) whose job
+# id is `publish`; it runs on `push` to main (and by hand). The image is built ONCE per commit and never rebuilt:
+#   1. changes   docs/metadata-only commit -> nothing below runs (no new image for a README change)
+#   2. build     build once, push to ghcr.io staging by digest (registry build cache is WRITTEN here), Trivy-scan that digest
+#   3. promote   copy that digest to Docker Hub with the tag sha-<7 chars> ONLY (no latest, no semver), cosign sign (keyless),
+#                SBOM attestation, self-verify; refuses commits not reachable from main
+#   4. gitops    open/update the pull request in the helm repository that moves env `dev` to this digest (gitops-promote.yaml)
+#   5. prune     keep the newest builds of the ghcr.io staging package (ghcr-prune.yaml); must never fail a publish
+#                (a calling job cannot say continue-on-error, so ghcr-prune.yaml itself has to swallow its own failures)
+# Release tags and `latest` are not made here: a version is chosen when the digest is promoted to stage/prod in the helm repository.
+#
+# Pins: the reusable workflows below are pinned to ONE commit of this repository (the release that introduced them). Until that
+# release exists they carry a placeholder pin, which tools/pin-service-workflows.sh replaces.
+#
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/service-publish.yaml@<sha> # <tag>
+# The calling job must grant: contents: read, packages: write, id-token: write.
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: Helm chart / application name = repository name without the `app-` prefix, e.g. checkout-service
+        type: string
+        required: true
+      image-name:
+        description: Docker Hub repository name under the account (default = app)
+        type: string
+        default: ""
+      context:
+        type: string
+        default: .
+      dockerfile:
+        type: string
+        default: Dockerfile
+      trivyignores:
+        description: Path to a .trivyignore file in the caller repo (optional)
+        type: string
+        default: ""
+      env:
+        description: Environment of the helm repository the new digest is proposed for
+        type: string
+        default: dev
+      auto-merge:
+        description: Let the helm pull request merge itself once the helm repository's checks pass
+        type: boolean
+        default: true
+      version:
+        description: Optional version label for gitops-promote (normally empty on dev)
+        type: string
+        default: ""
+      prune:
+        description: Prune old ghcr.io staging images after publishing (best effort)
+        type: boolean
+        default: true
+      prune-keep:
+        description: How many of the newest staging images the prune keeps
+        type: number
+        default: 10
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
+      PROMOTE_APP_ID:
+        required: true
+      PROMOTE_APP_PRIVATE_KEY:
+        required: true
+    outputs:
+      published:
+        description: "'true' when an image was built and published, 'false' for a documentation-only commit"
+        value: ${{ jobs.changes.outputs.code }}
+      image:
+        description: Docker Hub reference by digest (empty when nothing was published)
+        value: ${{ jobs.promote.outputs.image }}
+      digest:
+        description: Image digest (sha256:...)
+        value: ${{ jobs.promote.outputs.digest }}
+      tag:
+        description: The sha-<7 chars> tag
+        value: ${{ jobs.promote.outputs.tag }}
+      pr-url:
+        description: URL of the helm pull request
+        value: ${{ jobs.gitops.outputs.pr-url }}
+
+# Least privilege by default; every job below declares what it needs.
+permissions: {}
+
+jobs:
+  changes:
+    name: Change detection
+    permissions:
+      contents: read
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/changed-paths.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+
+  build:
+    name: Build, stage and scan
+    needs: [changes]
+    # only commits on main are published (docker-promote checks it again from the git history)
+    if: ${{ needs.changes.outputs.code == 'true' && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+      packages: write
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/docker-build.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    with:
+      context: ${{ inputs.context }}
+      dockerfile: ${{ inputs.dockerfile }}
+      trivyignores: ${{ inputs.trivyignores }}
+      cache-write: true # main is the only place the registry build cache is written
+
+  promote:
+    name: Promote, sign and SBOM
+    needs: [build]
+    permissions:
+      id-token: write # keyless cosign signing
+      contents: read
+      packages: read
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/docker-promote.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    with:
+      image-name: ${{ inputs.image-name || inputs.app }}
+      staged-image: ${{ needs.build.outputs.staged-image }}
+      digest: ${{ needs.build.outputs.digest }}
+      sha-only: true
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  gitops:
+    name: Propose to the helm repository
+    needs: [promote]
+    permissions: {} # gitops-promote works with the GitHub App token, not the workflow's
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    with:
+      app: ${{ inputs.app }}
+      env: ${{ inputs.env }}
+      image-tag: ${{ needs.promote.outputs.tag }}
+      image-digest: ${{ needs.promote.outputs.digest }}
+      source-repository: ${{ github.repository }}
+      source-sha: ${{ github.sha }}
+      version: ${{ inputs.version }}
+      auto-merge: ${{ inputs.auto-merge }}
+    secrets:
+      PROMOTE_APP_ID: ${{ secrets.PROMOTE_APP_ID }}
+      PROMOTE_APP_PRIVATE_KEY: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+
+  prune:
+    name: Prune staging images
+    needs: [promote]
+    if: ${{ inputs.prune }}
+    permissions:
+      packages: write
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/ghcr-prune.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    with:
+      package: ${{ github.event.repository.name }}
+      keep: ${{ inputs.prune-keep }}

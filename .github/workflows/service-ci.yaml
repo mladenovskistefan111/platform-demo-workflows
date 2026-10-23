@@ -1,0 +1,340 @@
+name: Service CI
+
+# The pull-request pipeline of every app repository, defined once. The caller is a 15-line file (tools/gen-callers.py) whose job id
+# is `ci`, so the single required status check is `ci / gate`.
+#
+# Everything runs IN PARALLEL after a small change-detection job:
+#   always:        Secret Scan, Workflow lint                       (cheap; they run for a docs-only change too)
+#   code changes:  the language workflow (lint/format, build, unit tests, SCA, SAST, optional E2E / smoke test)
+#                  and the image build + Trivy scan (built into the local Docker daemon, NOT pushed)
+#   always, last:  `gate` - fails if anything it waited for failed or was cancelled, and accepts "skipped" only where the change
+#                  filter (docs/metadata-only change) or the language choice explains it. Make `ci / gate` the required check.
+# language: go | node | python | java | dotnet | none (none = no language workflow). image: false skips the image build + scan.
+# `language: none, image: false` is secret scan + workflow lint + gate (product-catalog-db); `language: none` with the image left on
+# suits a repository whose tests are its own jobs (the developer portal).
+#
+# Pins: the reusable workflows below are pinned to ONE commit of this repository (the release that introduced them). Until that
+# release exists they carry a placeholder pin, which tools/pin-service-workflows.sh replaces; the workflow-lint rule "every
+# uses: is a full commit SHA" fails for as long as a placeholder is left.
+#
+# Call it with:  uses: platform-boutique/platform-demo-workflows/.github/workflows/service-ci.yaml@<sha> # <tag>
+# The calling job must grant: contents: read, packages: read (and checks: write for dotnet).
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: go | node | python | java | dotnet | none
+        type: string
+        required: true
+      # --- image (build + scan, not pushed) ---
+      image:
+        description: Build the image and scan it (when code changed). false for a repository without an image pipeline.
+        type: boolean
+        default: true
+      context:
+        description: Docker build context
+        type: string
+        default: .
+      dockerfile:
+        description: Dockerfile name inside the context
+        type: string
+        default: Dockerfile
+      trivyignores:
+        description: Path to a .trivyignore file in the caller repo (optional)
+        type: string
+        default: ""
+      # --- passed to the language workflow (names and defaults are those of go-ci, node-ci, ...; checked by tools/check-consistency.py) ---
+      build-path:
+        description: "go: package pattern passed to `go build`"
+        type: string
+        default: ./cmd/server/...
+      test-packages:
+        description: "go: package pattern passed to `go test`"
+        type: string
+        default: ./...
+      e2e-packages:
+        description: "go: package pattern for `go test -tags e2e`; empty skips the job"
+        type: string
+        default: ""
+      smoke-port:
+        description: "go, node: gRPC port for a start-the-server health smoke test; empty skips the job"
+        type: string
+        default: ""
+      smoke-env:
+        description: "go: newline-separated KEY=value pairs exported before the smoke-test server starts"
+        type: string
+        default: ""
+      smoke-command:
+        description: "node: command that starts the built server"
+        type: string
+        default: node dist/server.js
+      smoke-health-args:
+        description: "node: extra grpcurl arguments for the health check"
+        type: string
+        default: -import-path ./proto -proto health.proto
+      smoke-script:
+        description: "node: optional script in the caller repo for service-specific smoke checks"
+        type: string
+        default: ""
+      semgrep-config:
+        description: "node, java, dotnet: Semgrep rule sets; empty = the language workflow's default"
+        type: string
+        default: ""
+      node-version-file:
+        description: "node"
+        type: string
+        default: .nvmrc
+      python-version-file:
+        description: "python"
+        type: string
+        default: .python-version
+      source-dir:
+        description: "python: directory scanned by bandit"
+        type: string
+        default: src/
+      build-check-file:
+        description: "python: entry-point file that must parse"
+        type: string
+        default: src/server.py
+      tests-path:
+        description: "python"
+        type: string
+        default: tests/
+      bandit-config:
+        description: "python"
+        type: string
+        default: pyproject.toml
+      java-version:
+        description: "java"
+        type: string
+        default: "21"
+      java-distribution:
+        description: "java"
+        type: string
+        default: temurin
+      dotnet-version-file:
+        description: "dotnet"
+        type: string
+        default: global.json
+      solution:
+        description: "dotnet (required for dotnet)"
+        type: string
+        default: ""
+      project:
+        description: "dotnet (required for dotnet): main project"
+        type: string
+        default: ""
+      test-project:
+        description: "dotnet (required for dotnet)"
+        type: string
+        default: ""
+      test-filter:
+        description: "dotnet"
+        type: string
+        default: FullyQualifiedName!~Integration&FullyQualifiedName!~E2E
+
+# Least privilege by default; every job below declares what it needs.
+permissions: {}
+
+jobs:
+  changes:
+    name: Change detection
+    permissions:
+      contents: read
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/changed-paths.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+
+  # ─── always ───────────────────────────────────────────────────────────────
+
+  secret-scan:
+    name: Secret scan
+    permissions:
+      contents: read
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/secret-scan.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+
+  workflow-lint:
+    name: Workflow lint
+    permissions:
+      contents: read
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/workflow-lint.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+
+  # ─── only when code changed: the language workflow (exactly one of these runs) ───
+
+  go:
+    name: Go
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' && inputs.language == 'go' }}
+    permissions:
+      contents: read
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/go-ci.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    with:
+      build-path: ${{ inputs.build-path }}
+      test-packages: ${{ inputs.test-packages }}
+      e2e-packages: ${{ inputs.e2e-packages }}
+      smoke-port: ${{ inputs.smoke-port }}
+      smoke-env: ${{ inputs.smoke-env }}
+      secret-scan: false # one scan for every language: the secret-scan job above
+
+  node:
+    name: Node
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' && inputs.language == 'node' }}
+    permissions:
+      contents: read
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/node-ci.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    with:
+      node-version-file: ${{ inputs.node-version-file }}
+      semgrep-config: ${{ inputs.semgrep-config || 'p/typescript p/nodejs p/secrets' }}
+      smoke-port: ${{ inputs.smoke-port }}
+      smoke-command: ${{ inputs.smoke-command }}
+      smoke-health-args: ${{ inputs.smoke-health-args }}
+      smoke-script: ${{ inputs.smoke-script }}
+      secret-scan: false
+
+  python:
+    name: Python
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' && inputs.language == 'python' }}
+    permissions:
+      contents: read
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/python-ci.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    with:
+      python-version-file: ${{ inputs.python-version-file }}
+      source-dir: ${{ inputs.source-dir }}
+      build-check-file: ${{ inputs.build-check-file }}
+      tests-path: ${{ inputs.tests-path }}
+      bandit-config: ${{ inputs.bandit-config }}
+      secret-scan: false
+
+  java:
+    name: Java
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' && inputs.language == 'java' }}
+    permissions:
+      contents: read
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/java-gradle-ci.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    with:
+      java-version: ${{ inputs.java-version }}
+      java-distribution: ${{ inputs.java-distribution }}
+      semgrep-config: ${{ inputs.semgrep-config || 'p/java p/owasp-top-ten' }}
+      secret-scan: false
+
+  dotnet:
+    name: .NET
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' && inputs.language == 'dotnet' }}
+    permissions:
+      contents: read
+      checks: write # test-reporter publishes a check run
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/dotnet-ci.yaml@PLACEHOLDER_PIN_SHA # PLACEHOLDER_PIN_VERSION
+    with:
+      dotnet-version-file: ${{ inputs.dotnet-version-file }}
+      solution: ${{ inputs.solution }}
+      project: ${{ inputs.project }}
+      test-project: ${{ inputs.test-project }}
+      test-filter: ${{ inputs.test-filter }}
+      semgrep-config: ${{ inputs.semgrep-config || 'p/csharp p/owasp-top-ten' }}
+      secret-scan: false
+
+  # ─── only when code changed: image build + CVE scan, nothing is pushed ───
+
+  image:
+    name: Image build and CVE scan (not pushed)
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' && inputs.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read # reads the registry build cache (ghcr.io/<repo>/buildcache); writing it is service-publish's job
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io (to read the build cache)
+        # a cache that cannot be read only makes the build slower, so a failed login must not fail the pull request
+        continue-on-error: true
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Name the registry build cache
+        id: cache
+        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY,,}/buildcache" >> "$GITHUB_OUTPUT"
+
+      - name: Build the image into the local Docker daemon
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          push: false
+          load: true
+          tags: service-ci-scan:local
+          # read-only: pull requests (forks included) never write the cache; the publish run on main does
+          cache-from: type=registry,ref=${{ steps.cache.outputs.ref }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          # same version, threshold and ignore file as the scan in docker-build.yaml
+          version: v0.76.1
+          image-ref: service-ci-scan:local
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          trivyignores: ${{ inputs.trivyignores }}
+
+  # ─── the single required check ───────────────────────────────────────────
+
+  gate:
+    name: gate
+    if: ${{ always() }}
+    needs: [changes, secret-scan, workflow-lint, go, node, python, java, dotnet, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every job passed, or was skipped for a reason we know
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          LANGUAGE: ${{ inputs.language }}
+          IMAGE: ${{ inputs.image }}
+          CODE: ${{ needs.changes.outputs.code }}
+        run: |
+          case "$LANGUAGE" in
+            go|node|python|java|dotnet|none) ;;
+            *) echo "::error::unknown language '$LANGUAGE' (go | node | python | java | dotnet | none)"; exit 1 ;;
+          esac
+
+          # What must have SUCCEEDED. Everything else must have been SKIPPED: the other languages, the image when image is off, and
+          # (docs/metadata-only change, code != true) the language workflow and the image build. A failure, a cancellation, or a skip with no explanation
+          # fails the gate; so does a failed change detection (then code is empty and `changes` is not a success).
+          must_succeed=" changes secret-scan workflow-lint "
+          if [ "$CODE" = "true" ]; then
+            if [ "$LANGUAGE" != "none" ]; then must_succeed+="$LANGUAGE "; fi
+            if [ "$IMAGE" = "true" ]; then must_succeed+="image "; fi
+          fi
+
+          failed=0
+          {
+            echo "### Gate (language: $LANGUAGE, code changed: ${CODE:-unknown})"
+            echo
+            echo "| job | result | expected |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS=$'\t' read -r job result; do
+            if [[ "$must_succeed" == *" $job "* ]]; then want=success; else want=skipped; fi
+            if [ "$result" != "$want" ]; then
+              failed=1
+              echo "::error::$job is '$result', expected '$want'"
+            fi
+            printf '%-14s %-10s (expected %s)\n' "$job" "$result" "$want"
+            echo "| $job | $result | $want |" >> "$GITHUB_STEP_SUMMARY"
+          done < <(jq -r 'to_entries[] | [.key, .value.result] | @tsv' <<< "$NEEDS")
+          exit "$failed"

@@ -86,7 +86,7 @@ if os.path.exists(os.path.join(wfdir, "service-ci.yaml")):
             if "||" in expr:  # `inputs.x || 'child default'`: the fallback must be the child's default
                 if str(cd) not in expr:
                     problems.append(f"service-ci.yaml: fallback for {k} in job {lang} is not {fname}'s default {cd!r}")
-            elif cd != sd:
+            elif cd is not None and cd != sd:  # a required child input has no default
                 problems.append(f"service-ci.yaml: input {k} defaults to {sd!r}, {fname} says {cd!r}")
 
 if problems:
